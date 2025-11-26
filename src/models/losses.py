@@ -1,0 +1,173 @@
+"""
+DMTG损失函数模块 (论文公式11-14)
+
+L = w1·LDDIM + w2·Lsim + w3·Lstyle
+
+- LDDIM (Eq.11): 噪声预测MSE
+- Lsim  (Eq.12): 生成轨迹与人类模板的MSE
+- Lstyle(Eq.13): 生成轨迹复杂度与目标α的差距
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict
+
+
+class DMTGLoss(nn.Module):
+    """
+    DMTG完整损失函数 (论文公式14)
+
+    L = w1·LDDIM + w2·Lsim + w3·Lstyle
+
+    其中 (严格按照论文):
+    - LDDIM: 噪声预测MSE (公式11)
+    - Lsim: 生成轨迹与人类模板的MSE (公式12) - ||p_a - X̂||²
+    - Lstyle: 生成轨迹复杂度与目标α的差距 (公式13) - ||α - ratio(p_a)||²
+    """
+
+    def __init__(
+        self,
+        lambda_ddim: float = 1.0,     # w1: DDIM损失权重
+        lambda_sim: float = 0.1,      # w2: 相似度损失权重
+        lambda_style: float = 0.05,   # w3: 风格损失权重
+    ):
+        super().__init__()
+        self.lambda_ddim = lambda_ddim
+        self.lambda_sim = lambda_sim
+        self.lambda_style = lambda_style
+
+    def forward(
+        self,
+        predicted_noise: torch.Tensor,
+        target_noise: torch.Tensor,
+        predicted_x0: torch.Tensor = None,
+        target_x0: torch.Tensor = None,  # 人类模板 X̂
+        alpha: torch.Tensor = None,       # 目标复杂度 α
+        t: torch.Tensor = None,
+        timesteps: int = 1000,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        计算DMTG总损失 (论文公式14)
+        L = w1·LDDIM + w2·Lsim + w3·Lstyle
+
+        Args:
+            predicted_noise: 预测的噪声
+            target_noise: 目标噪声
+            predicted_x0: 预测的轨迹 p_a
+            target_x0: 人类模板轨迹 X̂
+            alpha: 目标复杂度参数 (batch,) - 用于Lstyle
+            t: 时间步
+            timesteps: 总时间步数
+        """
+        losses = {}
+
+        # 1. LDDIM: 噪声预测MSE (公式11)
+        ddim_loss = F.mse_loss(predicted_noise, target_noise)
+        losses['ddim_loss'] = ddim_loss
+        total_loss = self.lambda_ddim * ddim_loss
+
+        # 2. 辅助损失 (论文 Eq.12-13)
+        # 移除 t < 0.5T 约束，所有时间步都计算辅助损失
+        if predicted_x0 is not None and target_x0 is not None:
+            # Lsim (公式12): ||p_a - X̂||² - 生成轨迹与人类模板的差距
+            sim_loss = self._similarity_loss(predicted_x0, target_x0)
+            losses['similarity_loss'] = sim_loss
+            total_loss = total_loss + self.lambda_sim * sim_loss
+
+            # Lstyle (公式13): ||α - ratio(p_a)||² - 复杂度与目标α的差距
+            if alpha is not None:
+                style_loss = self._style_loss(predicted_x0, alpha)
+                losses['style_loss'] = style_loss
+                total_loss = total_loss + self.lambda_style * style_loss
+
+        losses['total_loss'] = total_loss
+        return losses
+
+    def _similarity_loss(self, predicted: torch.Tensor, template: torch.Tensor) -> torch.Tensor:
+        """
+        相似度损失 (论文公式12)
+        Lsim := ||p_a - X̂||²
+
+        p_a: 生成的轨迹
+        X̂: 人类模板轨迹
+        """
+        return F.mse_loss(predicted, template)
+
+    def _style_loss(self, predicted: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+        """
+        风格损失 (论文 Eq.13 + Eq.8-9)
+        Lstyle := ||α - C(p_a)||²
+
+        使用 MST 近似熵作为复杂度度量 (论文 Eq.8-9):
+        C(p_a) = (MST_ratio - 1) / 2, 归一化到 [0, 1]
+
+        α: 目标复杂度参数 (batch,) ∈ [0.3, 0.8]
+        C(p_a): 生成轨迹的 MST 复杂度 ∈ [0, 1]
+        """
+        # 计算 MST 近似: 路径长度 (相邻点距离之和)
+        segments = predicted[:, 1:, :] - predicted[:, :-1, :]  # (batch, seq-1, 2)
+        path_length = torch.norm(segments, dim=-1).sum(dim=-1)  # (batch,)
+
+        # 直线距离
+        straight_dist = torch.norm(
+            predicted[:, -1, :] - predicted[:, 0, :], dim=-1
+        ) + 1e-8  # (batch,)
+
+        # MST 比率
+        mst_ratio = path_length / straight_dist  # (batch,)
+
+        # 论文 Eq.8-9: 将 MST 比率归一化为复杂度 [0, 1]
+        # ratio=1 (直线) -> complexity=0
+        # ratio=3 (复杂曲线) -> complexity=1
+        pred_complexity = torch.clamp((mst_ratio - 1.0) / 2.0, 0.0, 1.0)
+
+        # Lstyle = ||α - C(p_a)||²
+        # α 直接作为目标复杂度，与 MST 复杂度比较
+        style_loss = F.mse_loss(pred_complexity, alpha)
+
+        return style_loss
+
+
+if __name__ == "__main__":
+    # 测试损失函数 (论文公式11-14)
+    print("Testing DMTG Loss (Paper Eq. 11-14)")
+    print("=" * 50)
+
+    batch_size = 4
+    seq_len = 50
+
+    predicted_noise = torch.randn(batch_size, seq_len, 2)
+    target_noise = torch.randn(batch_size, seq_len, 2)
+    predicted_x0 = torch.randn(batch_size, seq_len, 2)
+    target_x0 = torch.randn(batch_size, seq_len, 2)  # human template
+    alpha = torch.rand(batch_size)  # target complexity
+
+    # Test paper Eq.14: L = w1*LDDIM + w2*Lsim + w3*Lstyle
+    loss_fn = DMTGLoss(
+        lambda_ddim=1.0,   # w1
+        lambda_sim=0.1,    # w2
+        lambda_style=0.05, # w3
+    )
+    losses = loss_fn(
+        predicted_noise=predicted_noise,
+        target_noise=target_noise,
+        predicted_x0=predicted_x0,
+        target_x0=target_x0,
+        alpha=alpha,
+    )
+
+    print("Loss components:")
+    for name, value in losses.items():
+        print(f"  {name}: {value.item():.4f}")
+
+    print(f"\nAlpha values (target complexity): {[f'{a:.3f}' for a in alpha.tolist()]}")
+
+    # Verify Lstyle: ||target_ratio - ratio(p_a)||^2
+    segments = predicted_x0[:, 1:, :] - predicted_x0[:, :-1, :]
+    path_length = torch.norm(segments, dim=-1).sum(dim=-1)
+    straight_dist = torch.norm(predicted_x0[:, -1, :] - predicted_x0[:, 0, :], dim=-1) + 1e-8
+    pred_ratio = path_length / straight_dist
+    target_ratio = 1.0 + alpha * 2.0
+
+    print(f"\nPredicted path ratios: {[f'{r:.3f}' for r in pred_ratio.tolist()]}")
+    print(f"Target ratios (from alpha): {[f'{r:.3f}' for r in target_ratio.tolist()]}")
