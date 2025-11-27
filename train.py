@@ -54,10 +54,10 @@ class Trainer:
             weight_decay=0.01,
         )
 
-        # 学习率调度器
+        # 学习率调度器 (T_max 会在恢复训练时重新设置)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
-            T_max=100,
+            T_max=100,  # 默认值，恢复训练时会更新
             eta_min=1e-6,
         )
 
@@ -228,11 +228,14 @@ class Trainer:
 
     def train(self, num_epochs: int):
         """完整训练流程"""
-        print(f"Starting training for {num_epochs} epochs")
+        start_epoch = self.epoch  # 从当前epoch继续（恢复训练时不为0）
+        end_epoch = start_epoch + num_epochs
+
+        print(f"Starting training from epoch {start_epoch + 1} to {end_epoch}")
         print(f"Device: {self.device}")
         print(f"Train samples: {len(self.train_loader.dataset)}")
 
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, end_epoch):
             self.epoch = epoch + 1
 
             # 训练
@@ -295,8 +298,26 @@ def parse_args():
     parser.add_argument(
         "--boun_dir",
         type=str,
-        default="datasets/boun-mouse-dynamics-dataset",
-        help="BOUN数据集目录"
+        default=None,
+        help="BOUN原始数据集目录（不推荐，建议用预处理后的）"
+    )
+    parser.add_argument(
+        "--boun_processed_dir",
+        type=str,
+        default=None,
+        help="BOUN预处理后数据集目录（CSV格式）"
+    )
+    parser.add_argument(
+        "--boun_jsonl_dir",
+        type=str,
+        default="datasets/boun-processed",
+        help="BOUN预处理后数据集目录（JSONL格式，推荐）"
+    )
+    parser.add_argument(
+        "--open_images_dir",
+        type=str,
+        default="datasets/open_images_v6",
+        help="Open Images Localized Narratives数据集目录"
     )
     parser.add_argument(
         "--seq_length",
@@ -384,25 +405,40 @@ def main():
     # 检查数据集路径
     base_dir = Path(__file__).parent
     sapimouse_dir = base_dir / args.sapimouse_dir
-    boun_dir = base_dir / args.boun_dir
+    boun_dir = base_dir / args.boun_dir if args.boun_dir else None
+    boun_processed_dir = base_dir / args.boun_processed_dir if args.boun_processed_dir else None
+    boun_jsonl_dir = base_dir / args.boun_jsonl_dir if args.boun_jsonl_dir else None
+    open_images_dir = base_dir / args.open_images_dir if args.open_images_dir else None
 
     sapimouse_path = str(sapimouse_dir) if sapimouse_dir.exists() else None
-    boun_path = str(boun_dir) if boun_dir.exists() else None
+    boun_path = str(boun_dir) if boun_dir and boun_dir.exists() else None
+    boun_processed_path = str(boun_processed_dir) if boun_processed_dir and boun_processed_dir.exists() else None
+    boun_jsonl_path = str(boun_jsonl_dir) if boun_jsonl_dir and boun_jsonl_dir.exists() else None
+    open_images_path = str(open_images_dir) if open_images_dir and open_images_dir.exists() else None
 
-    if sapimouse_path is None and boun_path is None:
+    if sapimouse_path is None and boun_path is None and boun_processed_path is None and boun_jsonl_path is None and open_images_path is None:
         print("Error: No dataset found!")
         print(f"  Checked: {sapimouse_dir}")
         print(f"  Checked: {boun_dir}")
+        print(f"  Checked: {boun_processed_dir}")
+        print(f"  Checked: {boun_jsonl_dir}")
+        print(f"  Checked: {open_images_dir}")
         return
 
     print(f"SapiMouse: {sapimouse_path or 'Not found'}")
-    print(f"BOUN: {boun_path or 'Not found'}")
+    print(f"BOUN (raw): {boun_path or 'Not found'}")
+    print(f"BOUN (CSV): {boun_processed_path or 'Not found'}")
+    print(f"BOUN (JSONL): {boun_jsonl_path or 'Not found'}")
+    print(f"Open Images: {open_images_path or 'Not found'}")
 
     # 创建数据加载器 (分割训练集和验证集)
     print("\nLoading dataset...")
     train_loader, val_loader = create_dataloader(
         sapimouse_dir=sapimouse_path,
         boun_dir=boun_path,
+        boun_processed_dir=boun_processed_path,
+        boun_jsonl_dir=boun_jsonl_path,
+        open_images_dir=open_images_path,
         batch_size=args.batch_size,
         seq_length=args.seq_length,
         num_workers=args.num_workers,
