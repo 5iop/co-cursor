@@ -37,10 +37,17 @@ class Trainer:
         checkpoint_dir: str = "checkpoints",
         log_dir: str = "logs",
     ):
+        self.device = device
         self.model = model.to(device)
+
+        # 多GPU支持 (DataParallel)
+        self.multi_gpu = torch.cuda.device_count() > 1
+        if self.multi_gpu:
+            print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
+            self.model = nn.DataParallel(self.model)
+
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.device = device
         self.checkpoint_dir = Path(checkpoint_dir)
         self.log_dir = Path(log_dir)
 
@@ -198,10 +205,13 @@ class Trainer:
         if filename is None:
             filename = f"checkpoint_epoch_{self.epoch}.pt"
 
+        # DataParallel 包装后需要用 .module 获取原始模型
+        model_to_save = self.model.module if self.multi_gpu else self.model
+
         checkpoint = {
             'epoch': self.epoch,
             'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': model_to_save.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_loss': self.best_loss,
@@ -216,7 +226,10 @@ class Trainer:
         """加载检查点"""
         checkpoint = torch.load(path, map_location=self.device)
 
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # DataParallel 包装后需要用 .module 加载
+        model_to_load = self.model.module if self.multi_gpu else self.model
+        model_to_load.load_state_dict(checkpoint['model_state_dict'])
+
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.epoch = checkpoint['epoch']
