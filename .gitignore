@@ -50,6 +50,7 @@ logs/
 
 # Datasets (large files)
 datasets/
+!datasets/download.txt
 /data/
 !src/data/
 

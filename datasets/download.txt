@@ -1,0 +1,41 @@
+# SapiMouse Dataset
+https://www.ms.sapientia.ro/~manyi/sapimouse/sapimouse.zip
+  out=sapimouse.zip
+
+# BOUN Mouse Dynamics Dataset
+https://prod-dcd-datasets-cache-zipfiles.s3.eu-west-1.amazonaws.com/w6cxr8yc7p-2.zip
+  out=w6cxr8yc7p-2.zip
+
+# Localized Narratives - Open Images V6 Train (10 files)
+https://storage.googleapis.com/localized-narratives/annotations/open_images_train_v6_localized_narratives-00000-of-00010.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/open_images_train_v6_localized_narratives-00001-of-00010.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/open_images_train_v6_localized_narratives-00002-of-00010.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/open_images_train_v6_localized_narratives-00003-of-00010.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/open_images_train_v6_localized_narratives-00004-of-00010.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/open_images_train_v6_localized_narratives-00005-of-00010.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/open_images_train_v6_localized_narratives-00006-of-00010.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/open_images_train_v6_localized_narratives-00007-of-00010.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/open_images_train_v6_localized_narratives-00008-of-00010.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/open_images_train_v6_localized_narratives-00009-of-00010.jsonl
+
+# Localized Narratives - Open Images V6 Val & Test
+https://storage.googleapis.com/localized-narratives/annotations/open_images_validation_localized_narratives.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/open_images_test_localized_narratives.jsonl
+
+# Localized Narratives - COCO Train (4 files)
+https://storage.googleapis.com/localized-narratives/annotations/coco_train_localized_narratives-00000-of-00004.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/coco_train_localized_narratives-00001-of-00004.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/coco_train_localized_narratives-00002-of-00004.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/coco_train_localized_narratives-00003-of-00004.jsonl
+
+# Localized Narratives - COCO Val
+https://storage.googleapis.com/localized-narratives/annotations/coco_val_localized_narratives.jsonl
+
+# Localized Narratives - Flickr30k
+https://storage.googleapis.com/localized-narratives/annotations/flickr30k_train_localized_narratives.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/flickr30k_val_localized_narratives.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/flickr30k_test_localized_narratives.jsonl
+
+# Localized Narratives - ADE20k
+https://storage.googleapis.com/localized-narratives/annotations/ade20k_train_localized_narratives.jsonl
+https://storage.googleapis.com/localized-narratives/annotations/ade20k_validation_localized_narratives.jsonl
