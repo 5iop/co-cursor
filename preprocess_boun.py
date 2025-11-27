@@ -82,7 +82,7 @@ class UserProcessResult:
     total_points: int
 
 
-def process_session(csv_path: Path, min_steps: int = 100) -> List[np.ndarray]:
+def process_session(csv_path: Path, min_steps: int = 10) -> List[np.ndarray]:
     """
     处理单个session文件，按Released分割轨迹（内存优化版本）
 
@@ -340,7 +340,7 @@ def process_user_worker(args: Tuple[str, List[Path], int, Path]) -> UserProcessR
 def preprocess_boun(
     input_dir: str,
     output_dir: str,
-    min_steps: int = 100,
+    min_steps: int = 10,
     clean_output: bool = True,
     num_threads: int = NUM_THREADS,
 ):
@@ -503,7 +503,7 @@ def analyze_dataset(input_dir: str):
         print(f"  Max: {max(segment_lengths)}")
         print(f"  Mean: {np.mean(segment_lengths):.1f}")
         print(f"  Median: {np.median(segment_lengths):.1f}")
-        print(f"  Segments >= 100: {sum(1 for l in segment_lengths if l >= 100)}/{len(segment_lengths)}")
+        print(f"  Segments >= 10: {sum(1 for l in segment_lengths if l >= 10)}/{len(segment_lengths)}")
 
 
 def main():
@@ -523,7 +523,7 @@ def main():
     parser.add_argument(
         "--min_steps",
         type=int,
-        default=100,
+        default=10,
         help="Minimum number of Move events per trajectory"
     )
     parser.add_argument(

@@ -320,10 +320,10 @@ def parse_args():
         help="Open Images Localized Narratives数据集目录"
     )
     parser.add_argument(
-        "--seq_length",
+        "--max_length",
         type=int,
-        default=50,
-        help="轨迹序列长度"
+        default=500,
+        help="最大轨迹序列长度 N（论文默认500，使用 Padding with Masking）"
     )
     parser.add_argument(
         "--max_samples",
@@ -432,7 +432,9 @@ def main():
     print(f"Open Images: {open_images_path or 'Not found'}")
 
     # 创建数据加载器 (分割训练集和验证集)
+    # 使用 Sequence Padding with Masking 方法（与论文一致）
     print("\nLoading dataset...")
+    print(f"Max sequence length: {args.max_length} (Padding with Masking)")
     train_loader, val_loader = create_dataloader(
         sapimouse_dir=sapimouse_path,
         boun_dir=boun_path,
@@ -440,7 +442,7 @@ def main():
         boun_jsonl_dir=boun_jsonl_path,
         open_images_dir=open_images_path,
         batch_size=args.batch_size,
-        seq_length=args.seq_length,
+        max_length=args.max_length,
         num_workers=args.num_workers,
         max_samples=args.max_samples,
         val_split=0.1,  # 10% 验证集
@@ -454,7 +456,7 @@ def main():
     # 创建模型
     print("\nCreating model...")
     unet = TrajectoryUNet(
-        seq_length=args.seq_length,
+        seq_length=args.max_length,  # 使用 max_length 作为序列长度
         input_dim=2,
         base_channels=args.base_channels,
     )
@@ -462,7 +464,7 @@ def main():
     model = AlphaDDIM(
         model=unet,
         timesteps=args.timesteps,
-        seq_length=args.seq_length,
+        seq_length=args.max_length,  # 使用 max_length 作为序列长度
         input_dim=2,
     )
 

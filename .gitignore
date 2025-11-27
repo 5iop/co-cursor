@@ -50,7 +50,8 @@ logs/
 
 # Datasets (large files)
 datasets/
-data/
+/data/
+!src/data/
 
 # Logs and outputs
 *.log
