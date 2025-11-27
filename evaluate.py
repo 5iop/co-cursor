@@ -37,11 +37,13 @@ def load_real_trajectories(
     boun_dir: str = None,
     max_samples: int = 1000,
     seq_length: int = 500,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """加载真实轨迹数据
 
     Returns:
         trajectories: (N, seq_length, 2) padded轨迹数组
+        masks: (N, seq_length) 有效位置掩码
+        lengths: (N,) 每条轨迹的真实长度
         start_points: (N, 2) 真实起点（非padding）
         end_points: (N, 2) 真实终点（非padding）
     """
@@ -52,19 +54,25 @@ def load_real_trajectories(
         max_samples=max_samples,
     )
 
-    # 分别收集轨迹、起点、终点
+    # 分别收集轨迹、掩码、长度、起点、终点
     trajectories = []
+    masks = []
+    lengths = []
     start_points = []
     end_points = []
 
     for i in range(len(dataset)):
         item = dataset[i]
         trajectories.append(item['trajectory'].numpy())
+        masks.append(item['mask'].numpy())
+        lengths.append(item['length'].numpy()[0])
         start_points.append(item['start_point'].numpy())
         end_points.append(item['end_point'].numpy())
 
     return (
         np.stack(trajectories),
+        np.stack(masks),
+        np.array(lengths),
         np.stack(start_points),
         np.stack(end_points),
     )
@@ -109,12 +117,18 @@ def generate_trajectories(
 def evaluate_distribution(
     generated: np.ndarray,
     real: np.ndarray,
+    generated_masks: np.ndarray = None,
+    real_masks: np.ndarray = None,
 ) -> dict:
     """评估分布相似性"""
     metrics = TrajectoryMetrics()
 
     print("Computing distribution metrics...")
-    results = metrics.compare_distributions(generated, real)
+    results = metrics.compare_distributions(
+        generated, real,
+        generated_masks=generated_masks,
+        real_masks=real_masks,
+    )
 
     return results
 
@@ -122,12 +136,18 @@ def evaluate_distribution(
 def evaluate_classifiers(
     generated: np.ndarray,
     real: np.ndarray,
+    generated_masks: np.ndarray = None,
+    real_masks: np.ndarray = None,
 ) -> dict:
     """使用分类器评估"""
     clf_metrics = ClassifierMetrics()
 
     print("Training classifiers...")
-    results = clf_metrics.evaluate_with_classifiers(generated, real)
+    results = clf_metrics.evaluate_with_classifiers(
+        generated, real,
+        generated_masks=generated_masks,
+        real_masks=real_masks,
+    )
 
     return results
 
@@ -138,6 +158,7 @@ def compare_baselines(
     dmtg_generator: TrajectoryGenerator,
     num_samples: int = 100,
     alpha: float = 0.5,
+    seq_length: int = 500,
 ) -> dict:
     """与基线方法对比
 
@@ -147,6 +168,7 @@ def compare_baselines(
         dmtg_generator: DMTG轨迹生成器
         num_samples: 生成样本数
         alpha: 复杂度参数
+        seq_length: 轨迹序列长度（与DMTG保持一致）
     """
     results = {}
 
@@ -165,19 +187,19 @@ def compare_baselines(
     )
     results['DMTG'] = dmtg_trajectories
 
-    # 2. Bezier
+    # 2. Bezier（与DMTG使用相同序列长度）
     print("Generating Bezier trajectories...")
     bezier_trajectories = []
     for start, end in zip(selected_starts, selected_ends):
-        traj = BezierGenerator.generate(tuple(start), tuple(end), num_points=50)
+        traj = BezierGenerator.generate(tuple(start), tuple(end), num_points=seq_length)
         bezier_trajectories.append(traj)
     results['Bezier'] = np.array(bezier_trajectories)
 
-    # 3. Linear
+    # 3. Linear（与DMTG使用相同序列长度）
     print("Generating Linear trajectories...")
     linear_trajectories = []
     for start, end in zip(selected_starts, selected_ends):
-        traj = LinearGenerator.generate(tuple(start), tuple(end), num_points=50, noise_level=0.01)
+        traj = LinearGenerator.generate(tuple(start), tuple(end), num_points=seq_length, noise_level=0.01)
         linear_trajectories.append(traj)
     results['Linear'] = np.array(linear_trajectories)
 
@@ -257,7 +279,7 @@ def main():
 
     # 加载真实轨迹
     print("\nLoading real trajectories...")
-    real_trajectories, real_start_points, real_end_points = load_real_trajectories(
+    real_trajectories, real_masks, real_lengths, real_start_points, real_end_points = load_real_trajectories(
         sapimouse_dir=sapimouse_path,
         boun_dir=boun_path,
         max_samples=args.num_samples * 2,
@@ -289,7 +311,9 @@ def main():
     print("=" * 40)
     dist_results = evaluate_distribution(
         generated_trajectories,
-        real_trajectories[:args.num_samples]
+        real_trajectories[:args.num_samples],
+        generated_masks=None,  # 生成轨迹是完整500点，无需mask
+        real_masks=real_masks[:args.num_samples],
     )
     for name, value in dist_results.items():
         print(f"  {name}: {value:.6f}")
@@ -300,7 +324,9 @@ def main():
     print("=" * 40)
     clf_results = evaluate_classifiers(
         generated_trajectories,
-        real_trajectories[:args.num_samples]
+        real_trajectories[:args.num_samples],
+        generated_masks=None,
+        real_masks=real_masks[:args.num_samples],
     )
     for clf_name, scores in clf_results.items():
         print(f"\n  {clf_name}:")

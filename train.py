@@ -40,6 +40,9 @@ class Trainer:
         self.device = device
         self.model = model.to(device)
 
+        # 保存原始模型引用（用于访问模型方法和属性）
+        self.model_raw = self.model
+
         # 多GPU支持 (DataParallel)
         self.multi_gpu = torch.cuda.device_count() > 1
         if self.multi_gpu:
@@ -102,18 +105,18 @@ class Trainer:
             # α=0.8: 复杂轨迹 (更多曲线变化)
             alpha = 0.3 + 0.5 * torch.rand(batch_size, device=self.device)  # [0.3, 0.8]
 
-            # 随机采样时间步
-            t = torch.randint(0, self.model.timesteps, (batch_size,), device=self.device)
+            # 随机采样时间步（使用原始模型引用访问属性）
+            t = torch.randint(0, self.model_raw.timesteps, (batch_size,), device=self.device)
 
-            # 前向扩散
+            # 前向扩散（使用原始模型引用访问方法）
             noise = torch.randn_like(trajectory)
-            x_t, _ = self.model.q_sample(trajectory, t, noise)
+            x_t, _ = self.model_raw.q_sample(trajectory, t, noise)
 
             # 预测噪声 - 论文Eq.10: ε_θ(x_t, t, c, α)
-            predicted_noise = self.model.model(x_t, t, condition, alpha)
+            predicted_noise = self.model_raw.model(x_t, t, condition, alpha)
 
             # 计算预测的x0（用于辅助损失）
-            predicted_x0 = self.model.predict_x0_from_noise(x_t, t, predicted_noise)
+            predicted_x0 = self.model_raw.predict_x0_from_noise(x_t, t, predicted_noise)
 
             # 使用DMTGLoss计算完整损失 (论文公式14)
             # L = w1·LDDIM + w2·Lsim + w3·Lstyle
@@ -124,7 +127,7 @@ class Trainer:
                 target_x0=trajectory,  # 人类模板 X̂
                 alpha=alpha,           # 目标复杂度 (论文Eq.13)
                 t=t,
-                timesteps=self.model.timesteps,
+                timesteps=self.model_raw.timesteps,
                 mask=mask,             # 有效位置掩码
             )
             loss = loss_dict['total_loss']
@@ -179,14 +182,14 @@ class Trainer:
 
             # 随机采样α (论文推荐范围 0.3-0.8)
             alpha = 0.3 + 0.5 * torch.rand(batch_size, device=self.device)
-            t = torch.randint(0, self.model.timesteps, (batch_size,), device=self.device)
+            t = torch.randint(0, self.model_raw.timesteps, (batch_size,), device=self.device)
 
             noise = torch.randn_like(trajectory)
-            x_t, _ = self.model.q_sample(trajectory, t, noise)
-            predicted_noise = self.model.model(x_t, t, condition, alpha)
+            x_t, _ = self.model_raw.q_sample(trajectory, t, noise)
+            predicted_noise = self.model_raw.model(x_t, t, condition, alpha)
 
             # 计算预测的x0
-            predicted_x0 = self.model.predict_x0_from_noise(x_t, t, predicted_noise)
+            predicted_x0 = self.model_raw.predict_x0_from_noise(x_t, t, predicted_noise)
 
             # 使用DMTGLoss计算完整损失 (论文公式14)
             loss_dict = self.loss_fn(
@@ -196,7 +199,7 @@ class Trainer:
                 target_x0=trajectory,  # 人类模板 X̂
                 alpha=alpha,           # 目标复杂度 (论文Eq.13)
                 t=t,
-                timesteps=self.model.timesteps,
+                timesteps=self.model_raw.timesteps,
                 mask=mask,             # 有效位置掩码
             )
             total_loss += loss_dict['total_loss'].item()
@@ -209,13 +212,10 @@ class Trainer:
         if filename is None:
             filename = f"checkpoint_epoch_{self.epoch}.pt"
 
-        # DataParallel 包装后需要用 .module 获取原始模型
-        model_to_save = self.model.module if self.multi_gpu else self.model
-
         checkpoint = {
             'epoch': self.epoch,
             'global_step': self.global_step,
-            'model_state_dict': model_to_save.state_dict(),
+            'model_state_dict': self.model_raw.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_loss': self.best_loss,
@@ -230,9 +230,7 @@ class Trainer:
         """加载检查点"""
         checkpoint = torch.load(path, map_location=self.device)
 
-        # DataParallel 包装后需要用 .module 加载
-        model_to_load = self.model.module if self.multi_gpu else self.model
-        model_to_load.load_state_dict(checkpoint['model_state_dict'])
+        self.model_raw.load_state_dict(checkpoint['model_state_dict'])
 
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])

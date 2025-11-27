@@ -75,62 +75,175 @@ class TrajectoryMetrics:
     def __init__(self):
         self.dist_metrics = DistributionMetrics()
 
-    def extract_features(self, trajectory: np.ndarray) -> Dict[str, np.ndarray]:
+    def extract_features(
+        self,
+        trajectory: np.ndarray,
+        mask: np.ndarray = None,
+    ) -> Dict[str, np.ndarray]:
         """
         提取轨迹特征
 
         Args:
             trajectory: 轨迹数组 (seq_len, 2) 或 (batch, seq_len, 2)
+            mask: 有效位置掩码 (seq_len,) 或 (batch, seq_len)
 
         Returns:
             特征字典
         """
         if trajectory.ndim == 2:
             trajectory = trajectory[np.newaxis, :]
+            if mask is not None:
+                mask = mask[np.newaxis, :]
 
+        batch_size = trajectory.shape[0]
         features = {}
 
-        # 1. 速度特征
-        velocity = np.diff(trajectory, axis=1)  # (batch, seq_len-1, 2)
-        speed = np.linalg.norm(velocity, axis=-1)  # (batch, seq_len-1)
-        features['speed'] = speed.flatten()
-        features['speed_mean'] = np.mean(speed, axis=-1)
-        features['speed_std'] = np.std(speed, axis=-1)
+        # 如果没有mask，创建全1 mask
+        if mask is None:
+            mask = np.ones((batch_size, trajectory.shape[1]), dtype=np.float32)
 
-        # 2. 加速度特征
-        acceleration = np.diff(velocity, axis=1)  # (batch, seq_len-2, 2)
-        accel_magnitude = np.linalg.norm(acceleration, axis=-1)
-        features['acceleration'] = accel_magnitude.flatten()
-        features['acceleration_mean'] = np.mean(accel_magnitude, axis=-1)
+        # 计算每条轨迹的有效长度
+        lengths = mask.sum(axis=1).astype(int)
 
-        # 3. 曲率特征
-        curvature = self._compute_curvature(trajectory)
-        features['curvature'] = curvature.flatten()
-        features['curvature_mean'] = np.mean(curvature, axis=-1)
+        # 收集有效数据的特征
+        all_speeds = []
+        all_accels = []
+        all_curvatures = []
+        all_direction_changes = []
+        speed_means = []
+        speed_stds = []
+        accel_means = []
+        curvature_means = []
+        path_lengths = []
+        straight_distances = []
 
-        # 4. 方向变化
-        direction_change = self._compute_direction_change(velocity)
-        features['direction_change'] = direction_change.flatten()
+        for i in range(batch_size):
+            length = lengths[i]
+            if length < 3:
+                # 轨迹太短，跳过
+                continue
 
-        # 5. 轨迹长度
-        path_length = np.sum(speed, axis=-1)
-        features['path_length'] = path_length
+            # 提取有效部分的轨迹
+            valid_traj = trajectory[i, :length, :]  # (length, 2)
 
-        # 6. 直线距离
-        straight_distance = np.linalg.norm(
-            trajectory[:, -1, :] - trajectory[:, 0, :],
-            axis=-1
-        )
-        features['straight_distance'] = straight_distance
+            # 1. 速度
+            velocity = np.diff(valid_traj, axis=0)  # (length-1, 2)
+            speed = np.linalg.norm(velocity, axis=-1)  # (length-1,)
+            all_speeds.extend(speed.tolist())
+            speed_means.append(np.mean(speed))
+            speed_stds.append(np.std(speed))
 
-        # 7. 效率（直线距离/路径长度）
-        features['efficiency'] = straight_distance / (path_length + 1e-8)
+            # 2. 加速度
+            if length >= 3:
+                accel = np.diff(velocity, axis=0)  # (length-2, 2)
+                accel_mag = np.linalg.norm(accel, axis=-1)
+                all_accels.extend(accel_mag.tolist())
+                accel_means.append(np.mean(accel_mag))
 
-        # 8. 方向性加速度（论文中的关键特征）
-        directional_accel = self._compute_directional_acceleration(trajectory)
+            # 3. 曲率
+            if length >= 3:
+                curv = self._compute_curvature_single(valid_traj)
+                all_curvatures.extend(curv.tolist())
+                curvature_means.append(np.mean(curv))
+
+            # 4. 方向变化
+            if length >= 3:
+                dir_change = self._compute_direction_change_single(velocity)
+                all_direction_changes.extend(dir_change.tolist())
+
+            # 5. 轨迹长度
+            path_lengths.append(np.sum(speed))
+
+            # 6. 直线距离（使用真实起点和终点）
+            straight_dist = np.linalg.norm(valid_traj[-1] - valid_traj[0])
+            straight_distances.append(straight_dist)
+
+        # 转换为数组
+        features['speed'] = np.array(all_speeds) if all_speeds else np.array([0.0])
+        features['speed_mean'] = np.array(speed_means) if speed_means else np.array([0.0])
+        features['speed_std'] = np.array(speed_stds) if speed_stds else np.array([0.0])
+        features['acceleration'] = np.array(all_accels) if all_accels else np.array([0.0])
+        features['acceleration_mean'] = np.array(accel_means) if accel_means else np.array([0.0])
+        features['curvature'] = np.array(all_curvatures) if all_curvatures else np.array([0.0])
+        features['curvature_mean'] = np.array(curvature_means) if curvature_means else np.array([0.0])
+        features['direction_change'] = np.array(all_direction_changes) if all_direction_changes else np.array([0.0])
+        features['path_length'] = np.array(path_lengths) if path_lengths else np.array([0.0])
+        features['straight_distance'] = np.array(straight_distances) if straight_distances else np.array([0.0])
+        features['efficiency'] = features['straight_distance'] / (features['path_length'] + 1e-8)
+
+        # 8. 方向性加速度（使用mask版本）
+        directional_accel = self._compute_directional_acceleration_masked(trajectory, mask, lengths)
         features.update(directional_accel)
 
         return features
+
+    def _compute_curvature_single(self, trajectory: np.ndarray) -> np.ndarray:
+        """计算单条轨迹的曲率"""
+        dx = np.diff(trajectory[:, 0])
+        dy = np.diff(trajectory[:, 1])
+
+        ddx = np.diff(dx)
+        ddy = np.diff(dy)
+
+        numerator = np.abs(dx[:-1] * ddy - dy[:-1] * ddx)
+        denominator = (dx[:-1] ** 2 + dy[:-1] ** 2) ** 1.5 + 1e-8
+
+        return numerator / denominator
+
+    def _compute_direction_change_single(self, velocity: np.ndarray) -> np.ndarray:
+        """计算单条轨迹的方向变化"""
+        speed = np.linalg.norm(velocity, axis=-1, keepdims=True) + 1e-8
+        unit_velocity = velocity / speed
+
+        dot_product = np.sum(unit_velocity[1:] * unit_velocity[:-1], axis=-1)
+        dot_product = np.clip(dot_product, -1, 1)
+
+        return np.arccos(dot_product)
+
+    def _compute_directional_acceleration_masked(
+        self,
+        trajectory: np.ndarray,
+        mask: np.ndarray,
+        lengths: np.ndarray,
+    ) -> Dict[str, float]:
+        """计算带mask的方向性加速度"""
+        accel_right = []
+        accel_left = []
+        accel_up = []
+        accel_down = []
+
+        for i in range(len(trajectory)):
+            length = lengths[i]
+            if length < 3:
+                continue
+
+            valid_traj = trajectory[i, :length, :]
+            velocity = np.diff(valid_traj, axis=0)
+            acceleration = np.diff(velocity, axis=0)
+
+            accel_x = acceleration[:, 0]
+            accel_y = acceleration[:, 1]
+
+            moving_right = velocity[:-1, 0] > 0
+            moving_left = velocity[:-1, 0] < 0
+            moving_up = velocity[:-1, 1] < 0
+            moving_down = velocity[:-1, 1] > 0
+
+            if moving_right.any():
+                accel_right.append(np.abs(accel_x[moving_right]).mean())
+            if moving_left.any():
+                accel_left.append(np.abs(accel_x[moving_left]).mean())
+            if moving_up.any():
+                accel_up.append(np.abs(accel_y[moving_up]).mean())
+            if moving_down.any():
+                accel_down.append(np.abs(accel_y[moving_down]).mean())
+
+        return {
+            'accel_right': np.mean(accel_right) if accel_right else 0,
+            'accel_left': np.mean(accel_left) if accel_left else 0,
+            'accel_up': np.mean(accel_up) if accel_up else 0,
+            'accel_down': np.mean(accel_down) if accel_down else 0,
+        }
 
     def _compute_curvature(self, trajectory: np.ndarray) -> np.ndarray:
         """计算轨迹曲率"""
@@ -196,16 +309,24 @@ class TrajectoryMetrics:
     def compare_distributions(
         self,
         generated: np.ndarray,
-        real: np.ndarray
+        real: np.ndarray,
+        generated_masks: np.ndarray = None,
+        real_masks: np.ndarray = None,
     ) -> Dict[str, float]:
         """
         比较生成轨迹和真实轨迹的分布
 
+        Args:
+            generated: 生成的轨迹 (batch, seq_len, 2)
+            real: 真实轨迹 (batch, seq_len, 2)
+            generated_masks: 生成轨迹的掩码 (batch, seq_len)
+            real_masks: 真实轨迹的掩码 (batch, seq_len)
+
         Returns:
             各项指标的字典
         """
-        gen_features = self.extract_features(generated)
-        real_features = self.extract_features(real)
+        gen_features = self.extract_features(generated, generated_masks)
+        real_features = self.extract_features(real, real_masks)
 
         metrics = {}
 
@@ -254,7 +375,9 @@ class ClassifierMetrics:
     def prepare_data(
         self,
         generated: np.ndarray,
-        real: np.ndarray
+        real: np.ndarray,
+        generated_masks: np.ndarray = None,
+        real_masks: np.ndarray = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         准备分类器训练数据
@@ -262,6 +385,8 @@ class ClassifierMetrics:
         Args:
             generated: 生成的轨迹 (n_gen, seq_len, 2)
             real: 真实轨迹 (n_real, seq_len, 2)
+            generated_masks: 生成轨迹的掩码 (n_gen, seq_len)
+            real_masks: 真实轨迹的掩码 (n_real, seq_len)
 
         Returns:
             X: 特征矩阵
@@ -272,28 +397,40 @@ class ClassifierMetrics:
 
         # 处理生成轨迹
         for i in range(len(generated)):
-            feat = self._extract_feature_vector(generated[i:i+1])
-            features_list.append(feat)
-            labels.append(0)
+            gen_mask = generated_masks[i:i+1] if generated_masks is not None else None
+            feat = self._extract_feature_vector(generated[i:i+1], gen_mask)
+            if feat is not None:
+                features_list.append(feat)
+                labels.append(0)
 
         # 处理真实轨迹
         for i in range(len(real)):
-            feat = self._extract_feature_vector(real[i:i+1])
-            features_list.append(feat)
-            labels.append(1)
+            real_mask = real_masks[i:i+1] if real_masks is not None else None
+            feat = self._extract_feature_vector(real[i:i+1], real_mask)
+            if feat is not None:
+                features_list.append(feat)
+                labels.append(1)
 
         return np.array(features_list), np.array(labels)
 
-    def _extract_feature_vector(self, trajectory: np.ndarray) -> np.ndarray:
+    def _extract_feature_vector(
+        self,
+        trajectory: np.ndarray,
+        mask: np.ndarray = None,
+    ) -> Optional[np.ndarray]:
         """提取单条轨迹的特征向量"""
-        features = self.feature_extractor.extract_features(trajectory)
+        features = self.feature_extractor.extract_features(trajectory, mask)
+
+        # 检查特征是否有效
+        if len(features['speed_mean']) == 0:
+            return None
 
         # 构建特征向量
         vector = [
             features['speed_mean'][0],
             features['speed_std'][0],
-            features['acceleration_mean'][0],
-            features['curvature_mean'][0],
+            features['acceleration_mean'][0] if len(features['acceleration_mean']) > 0 else 0,
+            features['curvature_mean'][0] if len(features['curvature_mean']) > 0 else 0,
             features['path_length'][0],
             features['efficiency'][0],
             features.get('accel_right', 0),
@@ -308,7 +445,9 @@ class ClassifierMetrics:
         self,
         generated: np.ndarray,
         real: np.ndarray,
-        test_size: float = 0.2
+        generated_masks: np.ndarray = None,
+        real_masks: np.ndarray = None,
+        test_size: float = 0.2,
     ) -> Dict[str, Dict[str, float]]:
         """
         使用多种分类器评估
@@ -322,7 +461,7 @@ class ClassifierMetrics:
         from sklearn.neural_network import MLPClassifier
         from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
-        X, y = self.prepare_data(generated, real)
+        X, y = self.prepare_data(generated, real, generated_masks, real_masks)
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=42, stratify=y
         )
