@@ -14,7 +14,7 @@ from src.models.alpha_ddim import create_alpha_ddim, EntropyController
 
 def load_model(checkpoint_path: str, device: str = "cuda"):
     """加载训练好的模型"""
-    model = create_alpha_ddim(seq_length=50, device=device)
+    model = create_alpha_ddim(seq_length=500, device=device)
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])

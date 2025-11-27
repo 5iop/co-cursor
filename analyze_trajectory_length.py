@@ -5,17 +5,7 @@
 """
 import argparse
 
-# 使用 orjson 加速 JSON 解析
-try:
-    import orjson
-    def json_loads(s):
-        return orjson.loads(s)
-    JSONDecodeError = orjson.JSONDecodeError
-except ImportError:
-    import json
-    def json_loads(s):
-        return json.loads(s)
-    JSONDecodeError = json.JSONDecodeError
+import orjson
 import numpy as np
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,14 +26,14 @@ def analyze_jsonl_file(file_path: Path) -> list:
                     continue
 
                 try:
-                    record = json_loads(line)
+                    record = orjson.loads(line)
                     traces = record.get('traces', [])
 
                     for trace in traces:
                         if trace:
                             point_counts.append(len(trace))
 
-                except JSONDecodeError:
+                except orjson.JSONDecodeError:
                     continue
 
     except Exception as e:

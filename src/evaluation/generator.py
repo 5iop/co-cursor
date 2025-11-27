@@ -29,7 +29,7 @@ class TrajectoryGenerator:
         model: AlphaDDIM = None,
         checkpoint_path: str = None,
         device: str = "cuda",
-        seq_length: int = 50,
+        seq_length: int = 500,
         screen_size: Tuple[int, int] = (1920, 1080),
     ):
         """

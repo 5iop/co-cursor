@@ -21,7 +21,7 @@ class CNNClassifier(nn.Module):
     def __init__(
         self,
         input_dim: int = 2,
-        seq_length: int = 50,
+        seq_length: int = 500,
         num_filters: int = 64,
         kernel_sizes: List[int] = [3, 5, 7],
         dropout: float = 0.3,
@@ -252,7 +252,7 @@ class DeepClassifierEvaluator:
     def __init__(
         self,
         input_dim: int = 2,
-        seq_length: int = 50,
+        seq_length: int = 500,
         device: str = "cuda",
     ):
         self.input_dim = input_dim

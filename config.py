@@ -10,8 +10,9 @@ from typing import Tuple, List, Optional
 class DataConfig:
     """数据配置"""
     sapimouse_dir: str = "datasets/sapimouse"
-    boun_dir: str = "datasets/boun-mouse-dynamics-dataset"
-    seq_length: int = 50
+    boun_dir: str = "datasets/boun-processed"
+    open_images_dir: str = "datasets/open_images_v6"
+    seq_length: int = 500
     screen_size: Tuple[int, int] = (1920, 1080)
     min_trajectory_length: int = 10
     normalize: bool = True
@@ -33,7 +34,7 @@ class ModelConfig:
     beta_schedule: str = "cosine"  # "cosine" or "linear"
 
     # 输入参数
-    seq_length: int = 50
+    seq_length: int = 500
     input_dim: int = 2
 
 

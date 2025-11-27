@@ -185,7 +185,7 @@ class TrajectoryUNet(nn.Module):
 
     def __init__(
         self,
-        seq_length: int = 50,
+        seq_length: int = 500,
         input_dim: int = 2,
         base_channels: int = 64,
         channel_mults: tuple = (1, 2, 4),
@@ -327,10 +327,10 @@ class TrajectoryUNet(nn.Module):
 
 if __name__ == "__main__":
     # 测试模型
-    model = TrajectoryUNet(seq_length=50, input_dim=2)
+    model = TrajectoryUNet(seq_length=500, input_dim=2)
 
     batch_size = 4
-    x = torch.randn(batch_size, 50, 2)
+    x = torch.randn(batch_size, 500, 2)
     t = torch.randint(0, 1000, (batch_size,))
     cond = torch.randn(batch_size, 4)
     alpha = torch.rand(batch_size)  # 复杂度参数 [0, 1]

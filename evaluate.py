@@ -8,8 +8,9 @@ import argparse
 import torch
 import numpy as np
 from pathlib import Path
+from typing import Tuple
 from tqdm import tqdm
-import json
+import orjson
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -35,39 +36,68 @@ def load_real_trajectories(
     sapimouse_dir: str = None,
     boun_dir: str = None,
     max_samples: int = 1000,
-    seq_length: int = 50,
-) -> np.ndarray:
-    """加载真实轨迹数据"""
+    seq_length: int = 500,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """加载真实轨迹数据
+
+    Returns:
+        trajectories: (N, seq_length, 2) padded轨迹数组
+        start_points: (N, 2) 真实起点（非padding）
+        end_points: (N, 2) 真实终点（非padding）
+    """
     dataset = CombinedMouseDataset(
         sapimouse_dir=sapimouse_dir,
         boun_dir=boun_dir,
-        seq_length=seq_length,
+        max_length=seq_length,
         max_samples=max_samples,
     )
 
-    trajectories = np.array(dataset.all_trajectories)
-    return trajectories
+    # 分别收集轨迹、起点、终点
+    trajectories = []
+    start_points = []
+    end_points = []
+
+    for i in range(len(dataset)):
+        item = dataset[i]
+        trajectories.append(item['trajectory'].numpy())
+        start_points.append(item['start_point'].numpy())
+        end_points.append(item['end_point'].numpy())
+
+    return (
+        np.stack(trajectories),
+        np.stack(start_points),
+        np.stack(end_points),
+    )
 
 
 def generate_trajectories(
     generator: TrajectoryGenerator,
-    real_trajectories: np.ndarray,
+    start_points: np.ndarray,
+    end_points: np.ndarray,
     alpha: float = 0.5,
     num_samples: int = None,
 ) -> np.ndarray:
-    """使用模型生成轨迹"""
-    if num_samples is None:
-        num_samples = len(real_trajectories)
+    """使用模型生成轨迹
 
-    # 使用真实轨迹的起点和终点作为条件
-    indices = np.random.choice(len(real_trajectories), num_samples, replace=False)
-    start_points = real_trajectories[indices, 0, :]  # (n, 2)
-    end_points = real_trajectories[indices, -1, :]  # (n, 2)
+    Args:
+        generator: 轨迹生成器
+        start_points: (N, 2) 真实起点
+        end_points: (N, 2) 真实终点
+        alpha: 复杂度参数
+        num_samples: 生成样本数
+    """
+    if num_samples is None:
+        num_samples = len(start_points)
+
+    # 随机选择样本
+    indices = np.random.choice(len(start_points), num_samples, replace=False)
+    selected_starts = start_points[indices]
+    selected_ends = end_points[indices]
 
     print(f"Generating {num_samples} trajectories with alpha={alpha}...")
     generated = generator.generate_batch(
-        start_points=start_points,
-        end_points=end_points,
+        start_points=selected_starts,
+        end_points=selected_ends,
         alpha=alpha,
         normalized_input=True,
         return_normalized=True,
@@ -103,23 +133,32 @@ def evaluate_classifiers(
 
 
 def compare_baselines(
-    real_trajectories: np.ndarray,
+    start_points: np.ndarray,
+    end_points: np.ndarray,
     dmtg_generator: TrajectoryGenerator,
     num_samples: int = 100,
     alpha: float = 0.5,
 ) -> dict:
-    """与基线方法对比"""
+    """与基线方法对比
+
+    Args:
+        start_points: (N, 2) 真实起点
+        end_points: (N, 2) 真实终点
+        dmtg_generator: DMTG轨迹生成器
+        num_samples: 生成样本数
+        alpha: 复杂度参数
+    """
     results = {}
 
     # 选择样本
-    indices = np.random.choice(len(real_trajectories), num_samples, replace=False)
-    start_points = real_trajectories[indices, 0, :]
-    end_points = real_trajectories[indices, -1, :]
+    indices = np.random.choice(len(start_points), num_samples, replace=False)
+    selected_starts = start_points[indices]
+    selected_ends = end_points[indices]
 
     # 1. DMTG
     print("Generating DMTG trajectories...")
     dmtg_trajectories = dmtg_generator.generate_batch(
-        start_points, end_points,
+        selected_starts, selected_ends,
         alpha=alpha,
         normalized_input=True,
         return_normalized=True,
@@ -129,7 +168,7 @@ def compare_baselines(
     # 2. Bezier
     print("Generating Bezier trajectories...")
     bezier_trajectories = []
-    for start, end in zip(start_points, end_points):
+    for start, end in zip(selected_starts, selected_ends):
         traj = BezierGenerator.generate(tuple(start), tuple(end), num_points=50)
         bezier_trajectories.append(traj)
     results['Bezier'] = np.array(bezier_trajectories)
@@ -137,7 +176,7 @@ def compare_baselines(
     # 3. Linear
     print("Generating Linear trajectories...")
     linear_trajectories = []
-    for start, end in zip(start_points, end_points):
+    for start, end in zip(selected_starts, selected_ends):
         traj = LinearGenerator.generate(tuple(start), tuple(end), num_points=50, noise_level=0.01)
         linear_trajectories.append(traj)
     results['Linear'] = np.array(linear_trajectories)
@@ -163,8 +202,8 @@ def main():
     parser.add_argument(
         "--boun_dir",
         type=str,
-        default="datasets/boun-mouse-dynamics-dataset",
-        help="BOUN数据集目录"
+        default="datasets/boun-processed",
+        help="BOUN数据集目录（自动检测Parquet或JSONL格式）"
     )
     parser.add_argument(
         "--num_samples",
@@ -218,7 +257,7 @@ def main():
 
     # 加载真实轨迹
     print("\nLoading real trajectories...")
-    real_trajectories = load_real_trajectories(
+    real_trajectories, real_start_points, real_end_points = load_real_trajectories(
         sapimouse_dir=sapimouse_path,
         boun_dir=boun_path,
         max_samples=args.num_samples * 2,
@@ -238,7 +277,8 @@ def main():
     # 生成轨迹
     generated_trajectories = generate_trajectories(
         generator,
-        real_trajectories,
+        real_start_points,
+        real_end_points,
         alpha=args.alpha,
         num_samples=args.num_samples,
     )
@@ -274,7 +314,8 @@ def main():
         print("=" * 40)
 
         baseline_trajectories = compare_baselines(
-            real_trajectories,
+            real_start_points,
+            real_end_points,
             generator,
             num_samples=min(100, args.num_samples),
             alpha=args.alpha,
@@ -330,8 +371,8 @@ def main():
         }
     }
 
-    with open(output_dir / 'evaluation_results.json', 'w') as f:
-        json.dump(results, f, indent=2)
+    with open(output_dir / 'evaluation_results.json', 'wb') as f:
+        f.write(orjson.dumps(results, option=orjson.OPT_INDENT_2))
 
     print(f"\nResults saved to {output_dir}")
     print("\nEvaluation complete!")

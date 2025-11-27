@@ -12,7 +12,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from pathlib import Path
 from tqdm import tqdm
-import json
+import orjson
 from datetime import datetime
 
 # 添加src到路径
@@ -88,6 +88,7 @@ class Trainer:
 
         for batch in pbar:
             trajectory = batch['trajectory'].to(self.device)
+            mask = batch['mask'].to(self.device)  # 有效位置掩码
             start_point = batch['start_point'].to(self.device)
             end_point = batch['end_point'].to(self.device)
 
@@ -124,6 +125,7 @@ class Trainer:
                 alpha=alpha,           # 目标复杂度 (论文Eq.13)
                 t=t,
                 timesteps=self.model.timesteps,
+                mask=mask,             # 有效位置掩码
             )
             loss = loss_dict['total_loss']
 
@@ -168,6 +170,7 @@ class Trainer:
 
         for batch in tqdm(self.val_loader, desc="Validation"):
             trajectory = batch['trajectory'].to(self.device)
+            mask = batch['mask'].to(self.device)  # 有效位置掩码
             start_point = batch['start_point'].to(self.device)
             end_point = batch['end_point'].to(self.device)
 
@@ -194,6 +197,7 @@ class Trainer:
                 alpha=alpha,           # 目标复杂度 (论文Eq.13)
                 t=t,
                 timesteps=self.model.timesteps,
+                mask=mask,             # 有效位置掩码
             )
             total_loss += loss_dict['total_loss'].item()
             num_batches += 1
@@ -294,8 +298,8 @@ class Trainer:
         }
 
         log_path = self.log_dir / "training_log.json"
-        with open(log_path, 'w') as f:
-            json.dump(log, f, indent=2)
+        with open(log_path, 'wb') as f:
+            f.write(orjson.dumps(log, option=orjson.OPT_INDENT_2))
 
 
 def parse_args():
@@ -311,20 +315,8 @@ def parse_args():
     parser.add_argument(
         "--boun_dir",
         type=str,
-        default=None,
-        help="BOUN原始数据集目录（不推荐，建议用预处理后的）"
-    )
-    parser.add_argument(
-        "--boun_processed_dir",
-        type=str,
-        default=None,
-        help="BOUN预处理后数据集目录（CSV格式）"
-    )
-    parser.add_argument(
-        "--boun_jsonl_dir",
-        type=str,
         default="datasets/boun-processed",
-        help="BOUN预处理后数据集目录（JSONL格式，推荐）"
+        help="BOUN预处理后数据集目录（自动检测Parquet或JSONL格式）"
     )
     parser.add_argument(
         "--open_images_dir",
@@ -363,7 +355,7 @@ def parse_args():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=512,  # 3070显存8GB，模型小，可以用大batch
+        default=512,
         help="批次大小"
     )
     parser.add_argument(
@@ -419,29 +411,21 @@ def main():
     base_dir = Path(__file__).parent
     sapimouse_dir = base_dir / args.sapimouse_dir
     boun_dir = base_dir / args.boun_dir if args.boun_dir else None
-    boun_processed_dir = base_dir / args.boun_processed_dir if args.boun_processed_dir else None
-    boun_jsonl_dir = base_dir / args.boun_jsonl_dir if args.boun_jsonl_dir else None
     open_images_dir = base_dir / args.open_images_dir if args.open_images_dir else None
 
     sapimouse_path = str(sapimouse_dir) if sapimouse_dir.exists() else None
     boun_path = str(boun_dir) if boun_dir and boun_dir.exists() else None
-    boun_processed_path = str(boun_processed_dir) if boun_processed_dir and boun_processed_dir.exists() else None
-    boun_jsonl_path = str(boun_jsonl_dir) if boun_jsonl_dir and boun_jsonl_dir.exists() else None
     open_images_path = str(open_images_dir) if open_images_dir and open_images_dir.exists() else None
 
-    if sapimouse_path is None and boun_path is None and boun_processed_path is None and boun_jsonl_path is None and open_images_path is None:
+    if sapimouse_path is None and boun_path is None and open_images_path is None:
         print("Error: No dataset found!")
         print(f"  Checked: {sapimouse_dir}")
         print(f"  Checked: {boun_dir}")
-        print(f"  Checked: {boun_processed_dir}")
-        print(f"  Checked: {boun_jsonl_dir}")
         print(f"  Checked: {open_images_dir}")
         return
 
     print(f"SapiMouse: {sapimouse_path or 'Not found'}")
-    print(f"BOUN (raw): {boun_path or 'Not found'}")
-    print(f"BOUN (CSV): {boun_processed_path or 'Not found'}")
-    print(f"BOUN (JSONL): {boun_jsonl_path or 'Not found'}")
+    print(f"BOUN: {boun_path or 'Not found'}")
     print(f"Open Images: {open_images_path or 'Not found'}")
 
     # 创建数据加载器 (分割训练集和验证集)
@@ -451,8 +435,6 @@ def main():
     train_loader, val_loader = create_dataloader(
         sapimouse_dir=sapimouse_path,
         boun_dir=boun_path,
-        boun_processed_dir=boun_processed_path,
-        boun_jsonl_dir=boun_jsonl_path,
         open_images_dir=open_images_path,
         batch_size=args.batch_size,
         max_length=args.max_length,

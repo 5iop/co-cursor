@@ -6,17 +6,7 @@
 import sys
 import tkinter as tk
 
-# 使用 orjson 加速 JSON 解析
-try:
-    import orjson
-    def json_loads(s):
-        return orjson.loads(s)
-    JSONDecodeError = orjson.JSONDecodeError
-except ImportError:
-    import json
-    def json_loads(s):
-        return json.loads(s)
-    JSONDecodeError = json.JSONDecodeError
+import orjson
 from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 import numpy as np
@@ -365,8 +355,8 @@ class TrajectoryVisualizer:
                         continue
 
                     try:
-                        record = json_loads(line)
-                    except JSONDecodeError:
+                        record = orjson.loads(line)
+                    except orjson.JSONDecodeError:
                         continue
 
                     traces = record.get('traces', [])

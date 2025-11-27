@@ -45,24 +45,26 @@ class DMTGLoss(nn.Module):
         alpha: torch.Tensor = None,       # 目标复杂度 α
         t: torch.Tensor = None,
         timesteps: int = 1000,
+        mask: torch.Tensor = None,        # 有效位置掩码 (batch, seq_len)
     ) -> Dict[str, torch.Tensor]:
         """
         计算DMTG总损失 (论文公式14)
         L = w1·LDDIM + w2·Lsim + w3·Lstyle
 
         Args:
-            predicted_noise: 预测的噪声
-            target_noise: 目标噪声
-            predicted_x0: 预测的轨迹 p_a
-            target_x0: 人类模板轨迹 X̂
+            predicted_noise: 预测的噪声 (batch, seq_len, 2)
+            target_noise: 目标噪声 (batch, seq_len, 2)
+            predicted_x0: 预测的轨迹 p_a (batch, seq_len, 2)
+            target_x0: 人类模板轨迹 X̂ (batch, seq_len, 2)
             alpha: 目标复杂度参数 (batch,) - 用于Lstyle
             t: 时间步
             timesteps: 总时间步数
+            mask: 有效位置掩码 (batch, seq_len)，1表示有效，0表示padding
         """
         losses = {}
 
         # 1. LDDIM: 噪声预测MSE (公式11)
-        ddim_loss = F.mse_loss(predicted_noise, target_noise)
+        ddim_loss = self._masked_mse(predicted_noise, target_noise, mask)
         losses['ddim_loss'] = ddim_loss
         total_loss = self.lambda_ddim * ddim_loss
 
@@ -70,20 +72,43 @@ class DMTGLoss(nn.Module):
         # 移除 t < 0.5T 约束，所有时间步都计算辅助损失
         if predicted_x0 is not None and target_x0 is not None:
             # Lsim (公式12): ||p_a - X̂||² - 生成轨迹与人类模板的差距
-            sim_loss = self._similarity_loss(predicted_x0, target_x0)
+            sim_loss = self._similarity_loss(predicted_x0, target_x0, mask)
             losses['similarity_loss'] = sim_loss
             total_loss = total_loss + self.lambda_sim * sim_loss
 
             # Lstyle (公式13): ||α - ratio(p_a)||² - 复杂度与目标α的差距
             if alpha is not None:
-                style_loss = self._style_loss(predicted_x0, alpha)
+                style_loss = self._style_loss(predicted_x0, alpha, mask)
                 losses['style_loss'] = style_loss
                 total_loss = total_loss + self.lambda_style * style_loss
 
         losses['total_loss'] = total_loss
         return losses
 
-    def _similarity_loss(self, predicted: torch.Tensor, template: torch.Tensor) -> torch.Tensor:
+    def _masked_mse(
+        self,
+        predicted: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """带掩码的MSE损失"""
+        if mask is None:
+            return F.mse_loss(predicted, target)
+
+        # mask: (batch, seq_len) -> (batch, seq_len, 1)
+        mask = mask.unsqueeze(-1)
+        # 计算MSE
+        mse = (predicted - target) ** 2
+        # 应用掩码并求平均
+        masked_mse = (mse * mask).sum() / (mask.sum() * predicted.shape[-1] + 1e-8)
+        return masked_mse
+
+    def _similarity_loss(
+        self,
+        predicted: torch.Tensor,
+        template: torch.Tensor,
+        mask: torch.Tensor = None,
+    ) -> torch.Tensor:
         """
         相似度损失 (论文公式12)
         Lsim := ||p_a - X̂||²
@@ -91,9 +116,14 @@ class DMTGLoss(nn.Module):
         p_a: 生成的轨迹
         X̂: 人类模板轨迹
         """
-        return F.mse_loss(predicted, template)
+        return self._masked_mse(predicted, template, mask)
 
-    def _style_loss(self, predicted: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    def _style_loss(
+        self,
+        predicted: torch.Tensor,
+        alpha: torch.Tensor,
+        mask: torch.Tensor = None,
+    ) -> torch.Tensor:
         """
         风格损失 (论文 Eq.13 + Eq.8-9)
         Lstyle := ||α - C(p_a)||²
@@ -103,15 +133,36 @@ class DMTGLoss(nn.Module):
 
         α: 目标复杂度参数 (batch,) ∈ [0.3, 0.8]
         C(p_a): 生成轨迹的 MST 复杂度 ∈ [0, 1]
+        mask: 有效位置掩码 (batch, seq_len)
         """
-        # 计算 MST 近似: 路径长度 (相邻点距离之和)
-        segments = predicted[:, 1:, :] - predicted[:, :-1, :]  # (batch, seq-1, 2)
-        path_length = torch.norm(segments, dim=-1).sum(dim=-1)  # (batch,)
+        batch_size = predicted.shape[0]
+
+        if mask is not None:
+            # 对于每个样本，找到最后一个有效位置的索引
+            # mask: (batch, seq_len)
+            lengths = mask.sum(dim=1).long()  # (batch,)
+
+            # 计算路径长度（只计算有效段）
+            segments = predicted[:, 1:, :] - predicted[:, :-1, :]  # (batch, seq-1, 2)
+            segment_norms = torch.norm(segments, dim=-1)  # (batch, seq-1)
+            # 只计算mask有效范围内的段
+            segment_mask = mask[:, 1:] * mask[:, :-1]  # (batch, seq-1)
+            path_length = (segment_norms * segment_mask).sum(dim=-1)  # (batch,)
+
+            # 获取每个样本的真实终点
+            # 使用 lengths-1 作为索引获取最后一个有效点
+            end_indices = (lengths - 1).clamp(min=0)  # (batch,)
+            end_points = predicted[torch.arange(batch_size, device=predicted.device), end_indices]  # (batch, 2)
+            start_points = predicted[:, 0, :]  # (batch, 2)
+        else:
+            # 无mask时使用全部数据
+            segments = predicted[:, 1:, :] - predicted[:, :-1, :]
+            path_length = torch.norm(segments, dim=-1).sum(dim=-1)
+            end_points = predicted[:, -1, :]
+            start_points = predicted[:, 0, :]
 
         # 直线距离
-        straight_dist = torch.norm(
-            predicted[:, -1, :] - predicted[:, 0, :], dim=-1
-        ) + 1e-8  # (batch,)
+        straight_dist = torch.norm(end_points - start_points, dim=-1) + 1e-8  # (batch,)
 
         # MST 比率
         mst_ratio = path_length / straight_dist  # (batch,)

@@ -40,7 +40,7 @@ class AlphaDDIM(nn.Module):
         model: nn.Module,
         timesteps: int = 1000,
         beta_schedule: str = "cosine",
-        seq_length: int = 50,
+        seq_length: int = 500,
         input_dim: int = 2,
     ):
         super().__init__()
@@ -227,7 +227,8 @@ class AlphaDDIM(nn.Module):
         x = self._initialize_with_condition(batch_size, condition, device)
 
         # 设置采样时间步
-        step_size = self.timesteps // num_inference_steps
+        # 防止 step_size 为 0（当 num_inference_steps > self.timesteps 时）
+        step_size = max(1, self.timesteps // num_inference_steps)
         timesteps = list(range(0, self.timesteps, step_size))[::-1]
 
         # 论文 Eq.8-9: 熵控制器 (保证达到目标复杂度)
@@ -635,7 +636,7 @@ class EntropyController:
 
 
 def create_alpha_ddim(
-    seq_length: int = 50,
+    seq_length: int = 500,
     timesteps: int = 1000,
     base_channels: int = 64,
     device: str = "cuda",
@@ -662,11 +663,11 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    model = create_alpha_ddim(seq_length=50, device=device)
+    model = create_alpha_ddim(seq_length=500, device=device)
 
     # 测试前向传播
     batch_size = 4
-    x_0 = torch.randn(batch_size, 50, 2, device=device)
+    x_0 = torch.randn(batch_size, 500, 2, device=device)
     condition = torch.randn(batch_size, 4, device=device)
 
     losses = model.get_loss(x_0, condition)

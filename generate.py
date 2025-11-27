@@ -8,7 +8,7 @@ import argparse
 import torch
 import numpy as np
 from pathlib import Path
-import json
+import orjson
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -152,8 +152,8 @@ def main():
         }
     }
 
-    with open(output_path, 'w') as f:
-        json.dump(result, f, indent=2)
+    with open(output_path, 'wb') as f:
+        f.write(orjson.dumps(result, option=orjson.OPT_INDENT_2))
 
     print(f"\nTrajectory saved to {output_path}")
 
