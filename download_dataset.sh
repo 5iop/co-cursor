@@ -12,6 +12,7 @@ install_deps() {
     sudo add-apt-repository -y ppa:savoury1/backports
     sudo apt-get update
     sudo apt-get -y install aria2 vim p7zip-full
+    pip install -r requirements.txt
 }
 
 # 下载数据集

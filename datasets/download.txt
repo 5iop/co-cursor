@@ -6,6 +6,9 @@ https://www.ms.sapientia.ro/~manyi/sapimouse/sapimouse.zip
 https://prod-dcd-datasets-cache-zipfiles.s3.eu-west-1.amazonaws.com/w6cxr8yc7p-2.zip
   out=w6cxr8yc7p-2.zip
 
+http://hk1.n.sudo.cam/boun-processed.7z
+  out=boun-processed.7z
+
 # Localized Narratives - Open Images V6 Train (10 files)
 https://storage.googleapis.com/localized-narratives/annotations/open_images_train_v6_localized_narratives-00000-of-00010.jsonl
 https://storage.googleapis.com/localized-narratives/annotations/open_images_train_v6_localized_narratives-00001-of-00010.jsonl

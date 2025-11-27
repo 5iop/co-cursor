@@ -4,8 +4,19 @@
 优化大文件加载，支持归一化数据自动检测
 """
 import sys
-import json
 import tkinter as tk
+
+# 使用 orjson 加速 JSON 解析
+try:
+    import orjson
+    def json_loads(s):
+        return orjson.loads(s)
+    JSONDecodeError = orjson.JSONDecodeError
+except ImportError:
+    import json
+    def json_loads(s):
+        return json.loads(s)
+    JSONDecodeError = json.JSONDecodeError
 from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 import numpy as np
@@ -354,8 +365,8 @@ class TrajectoryVisualizer:
                         continue
 
                     try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
+                        record = json_loads(line)
+                    except JSONDecodeError:
                         continue
 
                     traces = record.get('traces', [])

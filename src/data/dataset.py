@@ -5,8 +5,19 @@ DMTG数据集加载和预处理模块
 支持多线程加载加速
 """
 import os
-import json
 import numpy as np
+
+# 使用 orjson 加速 JSON 解析（比标准 json 快 3-10 倍）
+try:
+    import orjson
+    def json_loads(s):
+        return orjson.loads(s)
+    JSONDecodeError = orjson.JSONDecodeError
+except ImportError:
+    import json
+    def json_loads(s):
+        return json.loads(s)
+    JSONDecodeError = json.JSONDecodeError
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -183,9 +194,9 @@ class MouseTrajectoryDataset(Dataset):
                         continue
 
                     try:
-                        record = json.loads(line)
+                        record = json_loads(line)
                         self._process_jsonl_record(record)
-                    except json.JSONDecodeError as e:
+                    except JSONDecodeError as e:
                         print(f"JSON decode error: {e}")
                         continue
 
@@ -385,10 +396,10 @@ class MouseTrajectoryDataset(Dataset):
                         continue
 
                     try:
-                        record = json.loads(line)
+                        record = json_loads(line)
                         trajs = self._process_jsonl_record_worker(record)
                         results.extend(trajs)
-                    except json.JSONDecodeError:
+                    except JSONDecodeError:
                         continue
 
                     # 每10%打印一次进度

@@ -3,8 +3,19 @@
 用于检查数据集中每个轨迹包含多少点，帮助决定mask长度
 支持多线程加速
 """
-import json
 import argparse
+
+# 使用 orjson 加速 JSON 解析
+try:
+    import orjson
+    def json_loads(s):
+        return orjson.loads(s)
+    JSONDecodeError = orjson.JSONDecodeError
+except ImportError:
+    import json
+    def json_loads(s):
+        return json.loads(s)
+    JSONDecodeError = json.JSONDecodeError
 import numpy as np
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,14 +36,14 @@ def analyze_jsonl_file(file_path: Path) -> list:
                     continue
 
                 try:
-                    record = json.loads(line)
+                    record = json_loads(line)
                     traces = record.get('traces', [])
 
                     for trace in traces:
                         if trace:
                             point_counts.append(len(trace))
 
-                except json.JSONDecodeError:
+                except JSONDecodeError:
                     continue
 
     except Exception as e:
