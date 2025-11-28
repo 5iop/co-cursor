@@ -63,8 +63,11 @@ def compute_loss_distribution(n_batches: int = 100, batch_size: int = 32, seq_le
         predicted_noise = torch.randn(batch_size, seq_len, 2)
         target_noise = torch.randn(batch_size, seq_len, 2)
 
+        # 生成随机alpha（论文推荐范围 [0.3, 0.8]）
+        alpha = 0.3 + 0.5 * torch.rand(batch_size)
+
         # 计算损失
-        losses = loss_fn(predicted_noise, target_noise, predicted_x0, target_x0)
+        losses = loss_fn(predicted_noise, target_noise, predicted_x0, target_x0, alpha=alpha)
 
         ddim_losses.append(losses['ddim_loss'].item())
         sim_losses.append(losses['similarity_loss'].item())
@@ -198,10 +201,11 @@ def plot_loss_vs_complexity(save_path: str = None):
             predicted.append(np.stack([x, y], axis=-1))
         predicted_x0 = torch.FloatTensor(np.array(predicted))
 
-        # 计算损失
+        # 计算损失（使用固定alpha=0.5作为目标复杂度）
         noise_p = torch.randn(batch_size, seq_len, 2)
         noise_t = torch.randn(batch_size, seq_len, 2)
-        losses = loss_fn(noise_p, noise_t, predicted_x0, target_x0)
+        alpha = torch.full((batch_size,), 0.5)  # 固定目标复杂度
+        losses = loss_fn(noise_p, noise_t, predicted_x0, target_x0, alpha=alpha)
 
         style_losses.append(losses['style_loss'].item())
         sim_losses.append(losses['similarity_loss'].item())
