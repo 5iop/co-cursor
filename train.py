@@ -186,9 +186,9 @@ class Trainer:
             # 这确保 style loss 学习正确的 α → 复杂度映射
             # α 基于路径长度比率: α = clamp((path_length/straight_dist - 1) / 2, 0, 1)
             # 必须传入mask以忽略padding部分，否则会错误计算终点和路径长度
+            # 注意: 训练时 α 保持 [0,1] 尺度，与 style loss 中的 pred_complexity 一致
+            # [0.3, 0.8] 约束只在采样时应用
             alpha = self.model_raw.compute_trajectory_alpha(trajectory, mask)
-            # 约束到论文推荐范围 [0.3, 0.8]
-            alpha = 0.3 + 0.5 * alpha  # 映射 [0,1] -> [0.3, 0.8]
 
             # 随机采样时间步（使用原始模型引用访问属性）
             t = torch.randint(0, self.model_raw.timesteps, (batch_size,), device=self.device)
@@ -267,8 +267,8 @@ class Trainer:
 
             # 从轨迹计算真实的复杂度α (与训练一致)
             # 必须传入mask以忽略padding部分
+            # 训练时 α 保持 [0,1] 尺度
             alpha = self.model_raw.compute_trajectory_alpha(trajectory, mask)
-            alpha = 0.3 + 0.5 * alpha  # 映射 [0,1] -> [0.3, 0.8]
             t = torch.randint(0, self.model_raw.timesteps, (batch_size,), device=self.device)
 
             noise = torch.randn_like(trajectory)
