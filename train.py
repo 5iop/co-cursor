@@ -1,6 +1,10 @@
 """
 DMTG训练脚本
 训练α-DDIM模型生成人类鼠标轨迹
+
+支持单GPU和多GPU (DDP) 训练:
+- 单GPU: python train.py
+- 多GPU: torchrun --nproc_per_node=NUM_GPUS train.py
 """
 import os
 import sys
@@ -9,7 +13,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from pathlib import Path
 from tqdm import tqdm
 import orjson
@@ -24,6 +31,60 @@ from src.models.alpha_ddim import AlphaDDIM
 from src.models.losses import DMTGLoss
 
 
+# ==================== DDP 工具函数 ====================
+
+def is_distributed() -> bool:
+    """检查是否在分布式环境中运行"""
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    """获取当前进程的 rank"""
+    if is_distributed():
+        return dist.get_rank()
+    return 0
+
+
+def get_world_size() -> int:
+    """获取总进程数"""
+    if is_distributed():
+        return dist.get_world_size()
+    return 1
+
+
+def is_main_process() -> bool:
+    """是否为主进程 (rank 0)"""
+    return get_rank() == 0
+
+
+def setup_distributed():
+    """初始化分布式训练环境"""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+        # 设置当前设备
+        torch.cuda.set_device(local_rank)
+
+        # 初始化进程组
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            world_size=world_size,
+            rank=rank,
+        )
+
+        return local_rank
+    return 0
+
+
+def cleanup_distributed():
+    """清理分布式环境"""
+    if is_distributed():
+        dist.destroy_process_group()
+
+
 class Trainer:
     """DMTG训练器"""
 
@@ -36,18 +97,29 @@ class Trainer:
         device: str = "cuda",
         checkpoint_dir: str = "checkpoints",
         log_dir: str = "logs",
+        # 损失权重 (论文 Eq.14)
+        lambda_ddim: float = 1.0,
+        lambda_sim: float = 0.1,
+        lambda_style: float = 0.05,
     ):
         self.device = device
         self.model = model.to(device)
 
-        # 保存原始模型引用（用于访问模型方法和属性）
+        # 保存原始模型引用（用于访问模型方法和属性，如 timesteps, q_sample 等）
         self.model_raw = self.model
 
-        # 多GPU支持 (DataParallel)
-        self.multi_gpu = torch.cuda.device_count() > 1
-        if self.multi_gpu:
-            print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
-            self.model = nn.DataParallel(self.model)
+        # DDP 多GPU支持
+        self.distributed = is_distributed()
+        if self.distributed:
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            # DDP 包装内部的 UNet（实际需要并行的部分）
+            self.model_raw.model = DDP(
+                self.model_raw.model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+            )
+            if is_main_process():
+                print(f"Using {get_world_size()} GPUs with DistributedDataParallel")
 
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -71,8 +143,12 @@ class Trainer:
             eta_min=1e-6,
         )
 
-        # 损失函数
-        self.loss_fn = DMTGLoss()
+        # 损失函数 (论文 Eq.14: L = w1·LDDIM + w2·Lsim + w3·Lstyle)
+        self.loss_fn = DMTGLoss(
+            lambda_ddim=lambda_ddim,
+            lambda_sim=lambda_sim,
+            lambda_style=lambda_style,
+        )
 
         # 训练状态
         self.global_step = 0
@@ -86,7 +162,12 @@ class Trainer:
         total_loss = 0
         num_batches = 0
 
-        pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
+        # DDP: 设置 sampler 的 epoch 以确保每个 epoch 数据打乱不同
+        if self.distributed and hasattr(self.train_loader.sampler, 'set_epoch'):
+            self.train_loader.sampler.set_epoch(self.epoch)
+
+        # 只在主进程显示进度条
+        pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}", disable=not is_main_process())
         loss_components = {'ddim': 0, 'sim': 0, 'style': 0, 'boundary': 0}
 
         for batch in pbar:
@@ -171,7 +252,7 @@ class Trainer:
         total_loss = 0
         num_batches = 0
 
-        for batch in tqdm(self.val_loader, desc="Validation"):
+        for batch in tqdm(self.val_loader, desc="Validation", disable=not is_main_process()):
             trajectory = batch['trajectory'].to(self.device)
             mask = batch['mask'].to(self.device)  # 有效位置掩码
             start_point = batch['start_point'].to(self.device)
@@ -208,14 +289,42 @@ class Trainer:
         return total_loss / num_batches
 
     def save_checkpoint(self, filename: str = None):
-        """保存检查点"""
+        """保存检查点 (只在主进程保存)"""
+        if not is_main_process():
+            return
+
         if filename is None:
             filename = f"checkpoint_epoch_{self.epoch}.pt"
+
+        # DDP: 需要 unwrap DDP wrapper 来获取原始权重
+        # 构建一个干净的 state_dict（不含 DDP 的 module. 前缀）
+        if self.distributed:
+            # 获取 AlphaDDIM 的 state_dict，但 UNet 部分需要 unwrap
+            state_dict = {}
+            for k, v in self.model_raw.state_dict().items():
+                # model.model. 开头的是 DDP 包装的 UNet
+                if k.startswith('model.module.'):
+                    # 去掉 module. 前缀
+                    new_key = k.replace('model.module.', 'model.')
+                    state_dict[new_key] = v
+                else:
+                    state_dict[k] = v
+            model_state = state_dict
+        else:
+            model_state = self.model_raw.state_dict()
+
+        # 提取模型配置（用于正确加载检查点）
+        model_config = {
+            'seq_length': self.model_raw.seq_length,
+            'timesteps': self.model_raw.timesteps,
+            'base_channels': self.model_raw.model.base_channels if hasattr(self.model_raw.model, 'base_channels') else 64,
+        }
 
         checkpoint = {
             'epoch': self.epoch,
             'global_step': self.global_step,
-            'model_state_dict': self.model_raw.state_dict(),
+            'model_state_dict': model_state,
+            'model_config': model_config,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_loss': self.best_loss,
@@ -246,21 +355,39 @@ class Trainer:
         start_epoch = self.epoch  # 从当前epoch继续（恢复训练时不为0）
         end_epoch = start_epoch + num_epochs
 
-        print(f"Starting training from epoch {start_epoch + 1} to {end_epoch}")
-        print(f"Device: {self.device}")
-        print(f"Train samples: {len(self.train_loader.dataset)}")
+        if is_main_process():
+            print(f"Starting training from epoch {start_epoch + 1} to {end_epoch}")
+            print(f"Device: {self.device}")
+            print(f"Train samples: {len(self.train_loader.dataset)}")
+            if self.distributed:
+                print(f"World size: {get_world_size()}")
 
         for epoch in range(start_epoch, end_epoch):
             self.epoch = epoch + 1
 
             # 训练
             train_loss = self.train_epoch()
-            print(f"Epoch {self.epoch} - Train Loss: {train_loss:.4f}")
+
+            # DDP: 同步所有进程的 loss 取平均
+            if self.distributed:
+                loss_tensor = torch.tensor([train_loss], device=self.device)
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+                train_loss = loss_tensor.item()
+
+            if is_main_process():
+                print(f"Epoch {self.epoch} - Train Loss: {train_loss:.4f}")
 
             # 验证
             if self.val_loader is not None:
                 val_loss = self.validate()
-                print(f"Epoch {self.epoch} - Val Loss: {val_loss:.4f}")
+
+                if self.distributed:
+                    loss_tensor = torch.tensor([val_loss], device=self.device)
+                    dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+                    val_loss = loss_tensor.item()
+
+                if is_main_process():
+                    print(f"Epoch {self.epoch} - Val Loss: {val_loss:.4f}")
 
                 # 保存最佳模型
                 if val_loss < self.best_loss:
@@ -281,12 +408,20 @@ class Trainer:
             # 保存训练日志
             self.save_training_log()
 
+            # DDP: 同步屏障，确保所有进程完成当前 epoch
+            if self.distributed:
+                dist.barrier()
+
         # 保存最终模型
         self.save_checkpoint("final_model.pt")
-        print("Training completed!")
+        if is_main_process():
+            print("Training completed!")
 
     def save_training_log(self):
-        """保存训练日志"""
+        """保存训练日志 (只在主进程保存)"""
+        if not is_main_process():
+            return
+
         log = {
             'epoch': self.epoch,
             'global_step': self.global_step,
@@ -395,15 +530,49 @@ def parse_args():
         help="从检查点恢复训练"
     )
 
+    # 损失权重 (论文 Eq.14)
+    parser.add_argument(
+        "--lambda_ddim",
+        type=float,
+        default=1.0,
+        help="DDIM噪声预测损失权重 (w1)"
+    )
+    parser.add_argument(
+        "--lambda_sim",
+        type=float,
+        default=0.1,
+        help="相似度损失权重 (w2)"
+    )
+    parser.add_argument(
+        "--lambda_style",
+        type=float,
+        default=0.05,
+        help="风格损失权重 (w3)"
+    )
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    print("=" * 50)
-    print("DMTG Training")
-    print("=" * 50)
+    # ==================== DDP 初始化 ====================
+    local_rank = setup_distributed()
+
+    # 设置设备
+    if is_distributed():
+        device = f"cuda:{local_rank}"
+    else:
+        device = args.device
+
+    if is_main_process():
+        print("=" * 50)
+        print("DMTG Training")
+        if is_distributed():
+            print(f"Mode: DistributedDataParallel ({get_world_size()} GPUs)")
+        else:
+            print("Mode: Single GPU")
+        print("=" * 50)
 
     # 检查数据集路径
     base_dir = Path(__file__).parent
@@ -416,40 +585,84 @@ def main():
     open_images_path = str(open_images_dir) if open_images_dir and open_images_dir.exists() else None
 
     if sapimouse_path is None and boun_path is None and open_images_path is None:
-        print("Error: No dataset found!")
-        print(f"  Checked: {sapimouse_dir}")
-        print(f"  Checked: {boun_dir}")
-        print(f"  Checked: {open_images_dir}")
+        if is_main_process():
+            print("Error: No dataset found!")
+            print(f"  Checked: {sapimouse_dir}")
+            print(f"  Checked: {boun_dir}")
+            print(f"  Checked: {open_images_dir}")
+        cleanup_distributed()
         return
 
-    print(f"SapiMouse: {sapimouse_path or 'Not found'}")
-    print(f"BOUN: {boun_path or 'Not found'}")
-    print(f"Open Images: {open_images_path or 'Not found'}")
+    if is_main_process():
+        print(f"SapiMouse: {sapimouse_path or 'Not found'}")
+        print(f"BOUN: {boun_path or 'Not found'}")
+        print(f"Open Images: {open_images_path or 'Not found'}")
 
-    # 创建数据加载器 (分割训练集和验证集)
-    # 使用 Sequence Padding with Masking 方法（与论文一致）
-    print("\nLoading dataset...")
-    print(f"Max sequence length: {args.max_length} (Padding with Masking)")
-    train_loader, val_loader = create_dataloader(
+    # ==================== 创建数据集 ====================
+    if is_main_process():
+        print("\nLoading dataset...")
+        print(f"Max sequence length: {args.max_length} (Padding with Masking)")
+
+    # 先创建完整数据集
+    from torch.utils.data import random_split
+    dataset = CombinedMouseDataset(
         sapimouse_dir=sapimouse_path,
         boun_dir=boun_path,
         open_images_dir=open_images_path,
-        batch_size=args.batch_size,
         max_length=args.max_length,
-        num_workers=args.num_workers,
         max_samples=args.max_samples,
-        val_split=0.1,  # 10% 验证集
-        return_val=True,
     )
 
-    print(f"Training samples: {len(train_loader.dataset)}")
-    if val_loader:
-        print(f"Validation samples: {len(val_loader.dataset)}")
+    # 分割训练集和验证集
+    total_size = len(dataset)
+    val_size = int(total_size * 0.1)
+    train_size = total_size - val_size
 
-    # 创建模型
-    print("\nCreating model...")
+    train_dataset, val_dataset = random_split(
+        dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+
+    # ==================== 创建数据加载器 (支持 DDP) ====================
+    if is_distributed():
+        train_sampler = DistributedSampler(train_dataset, shuffle=True)
+        val_sampler = DistributedSampler(val_dataset, shuffle=False)
+        shuffle = False  # 使用 sampler 时不能 shuffle
+    else:
+        train_sampler = None
+        val_sampler = None
+        shuffle = True
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=val_sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    ) if val_size > 0 else None
+
+    if is_main_process():
+        print(f"Training samples: {len(train_loader.dataset)}")
+        if val_loader:
+            print(f"Validation samples: {len(val_loader.dataset)}")
+
+    # ==================== 创建模型 ====================
+    if is_main_process():
+        print("\nCreating model...")
+
     unet = TrajectoryUNet(
-        seq_length=args.max_length,  # 使用 max_length 作为序列长度
+        seq_length=args.max_length,
         input_dim=2,
         base_channels=args.base_channels,
     )
@@ -457,29 +670,38 @@ def main():
     model = AlphaDDIM(
         model=unet,
         timesteps=args.timesteps,
-        seq_length=args.max_length,  # 使用 max_length 作为序列长度
+        seq_length=args.max_length,
         input_dim=2,
     )
 
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {num_params:,}")
+    if is_main_process():
+        num_params = sum(p.numel() for p in model.parameters())
+        print(f"Model parameters: {num_params:,}")
 
-    # 创建训练器
+    # ==================== 创建训练器 ====================
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
-        val_loader=val_loader,  # 添加验证集
+        val_loader=val_loader,
         lr=args.lr,
-        device=args.device,
+        device=device,  # 使用 DDP 设置的设备
         checkpoint_dir=args.checkpoint_dir,
+        # 损失权重 (论文 Eq.14)
+        lambda_ddim=args.lambda_ddim,
+        lambda_sim=args.lambda_sim,
+        lambda_style=args.lambda_style,
     )
 
     # 恢复训练
     if args.resume:
         trainer.load_checkpoint(args.resume)
 
-    # 开始训练
-    trainer.train(args.num_epochs)
+    # ==================== 开始训练 ====================
+    try:
+        trainer.train(args.num_epochs)
+    finally:
+        # 清理 DDP
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

@@ -47,11 +47,10 @@ class TrainingConfig:
     num_epochs: int = 100
     num_workers: int = 4
 
-    # 损失权重
-    lambda_sim: float = 1.0
-    lambda_style: float = 0.5
-    lambda_boundary: float = 2.0
-    lambda_human: float = 0.3
+    # 损失权重 (论文 Eq.14: L = w1·LDDIM + w2·Lsim + w3·Lstyle)
+    lambda_ddim: float = 1.0    # w1: DDIM噪声预测损失权重
+    lambda_sim: float = 0.1     # w2: 相似度损失权重
+    lambda_style: float = 0.05  # w3: 风格损失权重
 
     # 优化器参数
     grad_clip: float = 1.0

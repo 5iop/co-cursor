@@ -147,7 +147,14 @@ class AlphaDDIM(nn.Module):
 
         # 获取扩散参数
         alpha_t = self._extract(self.alphas_cumprod, t, x_t.shape)
-        alpha_t_prev = self._extract(self.alphas_cumprod, t_prev, x_t.shape)
+        alpha_t_prev_raw = self._extract(self.alphas_cumprod, t_prev, x_t.shape)
+        # 修复: 最后一步 (t_prev=0) 应该使用 alpha=1.0 (完全去噪状态)
+        # 否则 sqrt(1 - alpha_t_prev) 不为0，会残留噪声
+        alpha_t_prev = torch.where(
+            t_prev.view(-1, *([1] * (len(x_t.shape) - 1))) == 0,
+            torch.ones_like(alpha_t_prev_raw),
+            alpha_t_prev_raw
+        )
 
         # 预测x_0
         pred_x0 = self.predict_x0_from_noise(x_t, t, predicted_noise)
@@ -160,6 +167,11 @@ class AlphaDDIM(nn.Module):
         direction_norm = torch.norm(direction, dim=-1, keepdim=True) + 1e-8
         direction_unit = direction / direction_norm  # 单位方向向量
 
+        # 论文 Eq.4-5: kc 缩放因子
+        # 协方差应随端点距离缩放: Σ_X = kc * ||d|| * (d_unit ⊗ d_unit)
+        # 归一化坐标下最大距离为 sqrt(2)，将 kc 归一化到 [0, 1]
+        kc = direction_norm / (1.414 + 1e-8)  # sqrt(2) ≈ 1.414
+
         # DDIM基础噪声方差
         sigma_base = eta * torch.sqrt(
             (1 - alpha_t_prev) / (1 - alpha_t + 1e-8) * (1 - alpha_t / (alpha_t_prev + 1e-8))
@@ -167,9 +179,11 @@ class AlphaDDIM(nn.Module):
 
         # 生成两种噪声分量
         # 1. 方向性噪声 (沿轨迹方向的随机扰动)
+        # 论文 Eq.4: Σ_d = kc * ||d|| * direction ⊗ direction
         noise_along = torch.randn(batch_size, self.seq_length, 1, device=x_t.device)
         direction_unit_expanded = direction_unit.unsqueeze(1)  # (batch, 1, 2)
-        directional_noise = noise_along * direction_unit_expanded  # (batch, seq, 2)
+        kc_expanded = kc.unsqueeze(1)  # (batch, 1, 1)
+        directional_noise = kc_expanded * noise_along * direction_unit_expanded  # (batch, seq, 2)
 
         # 2. 各向同性噪声 (垂直于轨迹方向)
         isotropic_noise = torch.randn_like(x_t)

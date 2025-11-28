@@ -53,21 +53,16 @@ extract_datasets() {
         unzip -o downloads/sapimouse.zip -d datasets/
     fi
 
-    # 解压 BOUN (分卷压缩)
-    if [ -f "downloads/w6cxr8yc7p-2.zip" ]; then
-        echo "解压 BOUN..."
-        unzip -o downloads/w6cxr8yc7p-2.zip -d downloads/temp_boun/
-
-        if [ -f "downloads/temp_boun/boun-mouse-dynamics-dataset.zip" ]; then
-            7z x downloads/temp_boun/boun-mouse-dynamics-dataset.zip -odatasets/ -y
-        fi
-
-        rm -rf downloads/temp_boun
+    # 移动 BOUN Parquet 文件
+    if [ -f "downloads/boun_trajectories.parquet" ]; then
+        echo "移动 BOUN Parquet 文件..."
+        mkdir -p datasets/boun-processed
+        mv downloads/boun_trajectories.parquet datasets/boun-processed/
     fi
 
-    # Localized Narratives JSONL 文件直接移动到 datasets/open_images_v6
+    # 移动 Open Images Parquet 文件
     mkdir -p datasets/open_images_v6
-    mv downloads/*.jsonl datasets/open_images_v6/ 2>/dev/null || true
+    mv downloads/open_images_v6-*.parquet datasets/open_images_v6/ 2>/dev/null || true
 
     echo "=========================================="
     echo "解压完成!"

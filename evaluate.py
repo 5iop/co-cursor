@@ -25,7 +25,18 @@ def load_model(checkpoint_path: str, device: str = "cuda"):
     """加载训练好的模型"""
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    model = create_alpha_ddim(device=device)
+    # 从检查点读取模型配置（如果有），否则使用默认值
+    model_config = checkpoint.get('model_config', {})
+    seq_length = model_config.get('seq_length', 500)
+    timesteps = model_config.get('timesteps', 1000)
+    base_channels = model_config.get('base_channels', 64)
+
+    model = create_alpha_ddim(
+        seq_length=seq_length,
+        timesteps=timesteps,
+        base_channels=base_channels,
+        device=device
+    )
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
@@ -97,8 +108,11 @@ def generate_trajectories(
     if num_samples is None:
         num_samples = len(start_points)
 
-    # 随机选择样本
-    indices = np.random.choice(len(start_points), num_samples, replace=False)
+    # 随机选择样本（确保不超过可用样本数）
+    actual_samples = min(num_samples, len(start_points))
+    if actual_samples < num_samples:
+        print(f"Warning: Requested {num_samples} samples but only {len(start_points)} available")
+    indices = np.random.choice(len(start_points), actual_samples, replace=False)
     selected_starts = start_points[indices]
     selected_ends = end_points[indices]
 
@@ -172,8 +186,11 @@ def compare_baselines(
     """
     results = {}
 
-    # 选择样本
-    indices = np.random.choice(len(start_points), num_samples, replace=False)
+    # 选择样本（确保不超过可用样本数）
+    actual_samples = min(num_samples, len(start_points))
+    if actual_samples < num_samples:
+        print(f"Warning: Requested {num_samples} samples but only {len(start_points)} available")
+    indices = np.random.choice(len(start_points), actual_samples, replace=False)
     selected_starts = start_points[indices]
     selected_ends = end_points[indices]
 

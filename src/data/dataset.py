@@ -25,6 +25,10 @@ class MouseTrajectoryDataset(Dataset):
     - 保留原始轨迹点数，不进行重采样
     - 短于 max_length 的轨迹用 [0, 0] 填充
     - 返回 mask 标记有效位置
+
+    支持两种加载模式：
+    - eager (默认): 一次性加载所有数据到内存，访问快但内存占用大
+    - lazy: 仅存储文件索引，按需加载数据，适合大数据集
     """
 
     def __init__(
@@ -35,6 +39,7 @@ class MouseTrajectoryDataset(Dataset):
         normalize: bool = True,
         screen_size: Tuple[int, int] = (1920, 1080),
         min_trajectory_length: int = 10,
+        lazy: bool = False,  # 是否启用懒加载
     ):
         """
         Args:
@@ -44,6 +49,7 @@ class MouseTrajectoryDataset(Dataset):
             normalize: 是否归一化坐标（BOUN Parquet数据已预归一化）
             screen_size: 屏幕尺寸 (width, height)
             min_trajectory_length: 最小轨迹长度
+            lazy: 是否启用懒加载（仅支持 Parquet 格式）
         """
         self.data_dir = Path(data_dir)
         self.dataset_type = dataset_type
@@ -51,8 +57,16 @@ class MouseTrajectoryDataset(Dataset):
         self.normalize = normalize
         self.screen_size = screen_size
         self.min_trajectory_length = min_trajectory_length
+        self.lazy = lazy
 
-        self.trajectories = []  # 存储 (coords, length) 元组
+        # Eager模式: 存储 (coords, length, timestamps) 元组，timestamps 可为 None
+        # Lazy模式: 存储 (file_path, row_index) 元组
+        self.trajectories = []
+
+        # Lazy模式缓存
+        self._parquet_cache = {}  # file_path -> (x_col, y_col)
+        self._cache_max_files = 3  # 最多缓存3个文件
+
         self._load_data()
 
     def _load_data(self):
@@ -63,6 +77,8 @@ class MouseTrajectoryDataset(Dataset):
             self._load_boun_parquet()
         elif self.dataset_type == "boun_jsonl":
             self._load_jsonl()
+        elif self.dataset_type == "open_images_parquet":
+            self._load_open_images_parquet()
         elif self.dataset_type == "open_images":
             self._load_jsonl()
         else:
@@ -98,33 +114,109 @@ class MouseTrajectoryDataset(Dataset):
             print(f"Parquet file not found: {parquet_file}")
             return
 
-        print(f"Loading BOUN Parquet from {parquet_file}...")
+        if self.lazy:
+            # Lazy模式：只扫描索引
+            print(f"Lazy loading BOUN Parquet from {parquet_file}...")
+            table = pq.read_table(parquet_file, columns=['x'])  # 只读x列获取长度
+            x_col = table.column('x')
 
-        # 读取Parquet文件
-        table = pq.read_table(parquet_file)
+            for i in range(len(table)):
+                x_list = x_col[i].as_py()
+                if len(x_list) >= self.min_trajectory_length:
+                    self.trajectories.append((str(parquet_file), i))
 
-        # 提取列数据
-        x_col = table.column('x')
-        y_col = table.column('y')
+            print(f"Found {len(self.trajectories)} valid trajectories (lazy)")
+        else:
+            # Eager模式：加载全部数据到内存
+            print(f"Loading BOUN Parquet from {parquet_file}...")
 
-        num_trajectories = len(table)
-        print(f"Found {num_trajectories} trajectories in Parquet file")
+            # 读取Parquet文件
+            table = pq.read_table(parquet_file)
 
-        for i in tqdm(range(num_trajectories), desc="Loading BOUN"):
-            x_list = x_col[i].as_py()
-            y_list = y_col[i].as_py()
+            # 提取列数据
+            x_col = table.column('x')
+            y_col = table.column('y')
 
-            if len(x_list) < self.min_trajectory_length:
-                continue
+            num_trajectories = len(table)
+            print(f"Found {num_trajectories} trajectories in Parquet file")
 
-            # 数据已归一化，直接构建坐标数组
-            coords = np.column_stack([x_list, y_list]).astype(np.float32)
+            for i in tqdm(range(num_trajectories), desc="Loading BOUN"):
+                x_list = x_col[i].as_py()
+                y_list = y_col[i].as_py()
 
-            # 截断过长的轨迹
-            if len(coords) > self.max_length:
-                coords = coords[:self.max_length]
+                if len(x_list) < self.min_trajectory_length:
+                    continue
 
-            self.trajectories.append((coords, len(coords)))
+                # 数据已归一化，直接构建坐标数组
+                coords = np.column_stack([x_list, y_list]).astype(np.float32)
+
+                # 截断过长的轨迹
+                if len(coords) > self.max_length:
+                    coords = coords[:self.max_length]
+
+                self.trajectories.append((coords, len(coords)))
+
+    def _load_open_images_parquet(self):
+        """加载 Open Images Parquet 数据集（支持多个 Parquet 文件，包含 x, y, t 列）"""
+        parquet_files = sorted(self.data_dir.glob("*.parquet"))
+
+        if not parquet_files:
+            print(f"No Parquet files found in {self.data_dir}")
+            return
+
+        if self.lazy:
+            # Lazy模式：只扫描索引，不加载实际数据
+            print(f"Lazy loading Open Images Parquet ({len(parquet_files)} files)...")
+
+            for parquet_file in tqdm(parquet_files, desc="Scanning Parquet files"):
+                try:
+                    # 只读x列获取长度信息
+                    table = pq.read_table(parquet_file, columns=['x'])
+                except Exception as e:
+                    print(f"  Error reading {parquet_file.name}: {e}")
+                    continue
+
+                x_col = table.column('x')
+
+                for i in range(len(table)):
+                    x_list = x_col[i].as_py()
+                    if len(x_list) >= self.min_trajectory_length:
+                        self.trajectories.append((str(parquet_file), i))
+
+            print(f"Found {len(self.trajectories)} valid trajectories (lazy)")
+        else:
+            # Eager模式：加载全部数据到内存
+            print(f"Loading Open Images Parquet ({len(parquet_files)} files)...")
+
+            for parquet_file in tqdm(parquet_files, desc="Loading Parquet files"):
+                try:
+                    table = pq.read_table(parquet_file)
+                except Exception as e:
+                    print(f"  Error reading {parquet_file.name}: {e}")
+                    continue
+
+                x_col = table.column('x')
+                y_col = table.column('y')
+                t_col = table.column('t') if 't' in table.column_names else None
+
+                for i in range(len(table)):
+                    x_list = x_col[i].as_py()
+                    y_list = y_col[i].as_py()
+
+                    if len(x_list) < self.min_trajectory_length:
+                        continue
+
+                    # 数据已归一化，直接构建坐标数组
+                    coords = np.column_stack([x_list, y_list]).astype(np.float32)
+                    timestamps = np.array(t_col[i].as_py(), dtype=np.float32) if t_col else None
+
+                    # 截断过长的轨迹
+                    if len(coords) > self.max_length:
+                        coords = coords[:self.max_length]
+                        if timestamps is not None:
+                            timestamps = timestamps[:self.max_length]
+
+                    self.trajectories.append((coords, len(coords), timestamps))
 
     def _load_jsonl(self):
         """加载JSONL格式数据集"""
@@ -283,21 +375,74 @@ class MouseTrajectoryDataset(Dataset):
     def __len__(self) -> int:
         return len(self.trajectories)
 
+    def _get_parquet_data(self, file_path: str, row_idx: int) -> Tuple[np.ndarray, int, Optional[np.ndarray]]:
+        """懒加载模式：从Parquet文件获取指定行的轨迹数据"""
+        # 简单LRU缓存
+        if file_path not in self._parquet_cache:
+            # 缓存满时删除最老的
+            if len(self._parquet_cache) >= self._cache_max_files:
+                oldest_key = next(iter(self._parquet_cache))
+                del self._parquet_cache[oldest_key]
+
+            # 加载整个文件到缓存
+            table = pq.read_table(file_path)
+            t_col = table.column('t') if 't' in table.column_names else None
+            self._parquet_cache[file_path] = (
+                table.column('x'),
+                table.column('y'),
+                t_col,
+            )
+
+        x_col, y_col, t_col = self._parquet_cache[file_path]
+
+        x_list = x_col[row_idx].as_py()
+        y_list = y_col[row_idx].as_py()
+
+        coords = np.column_stack([x_list, y_list]).astype(np.float32)
+        timestamps = np.array(t_col[row_idx].as_py(), dtype=np.float32) if t_col else None
+
+        # 截断过长的轨迹
+        if len(coords) > self.max_length:
+            coords = coords[:self.max_length]
+            if timestamps is not None:
+                timestamps = timestamps[:self.max_length]
+
+        return coords, len(coords), timestamps
+
     def __getitem__(self, idx: int) -> dict:
-        coords, length = self.trajectories[idx]
+        if self.lazy:
+            # Lazy模式：按需加载
+            file_path, row_idx = self.trajectories[idx]
+            coords, length, timestamps = self._get_parquet_data(file_path, row_idx)
+        else:
+            # Eager模式：直接从内存获取
+            item = self.trajectories[idx]
+            if len(item) == 3:
+                coords, length, timestamps = item
+            else:
+                coords, length = item
+                timestamps = None
 
         padded_traj, mask = self._pad_trajectory(coords, length)
 
         start_point = coords[0]
         end_point = coords[-1]
 
-        return {
+        result = {
             'trajectory': torch.FloatTensor(padded_traj),
             'mask': torch.FloatTensor(mask),
             'start_point': torch.FloatTensor(start_point),
             'end_point': torch.FloatTensor(end_point),
             'length': torch.LongTensor([length]),
         }
+
+        # 添加时间戳（如果有）
+        if timestamps is not None:
+            padded_t = np.zeros(self.max_length, dtype=np.float32)
+            padded_t[:length] = timestamps[:length]
+            result['timestamps'] = torch.FloatTensor(padded_t)
+
+        return result
 
 
 class CombinedMouseDataset(Dataset):
@@ -311,17 +456,21 @@ class CombinedMouseDataset(Dataset):
         max_length: int = 500,
         normalize: bool = True,
         max_samples: Optional[int] = None,
+        lazy: bool = False,  # 是否启用懒加载（仅对Parquet格式有效）
     ):
         self.max_length = max_length
+        self.lazy = lazy
         self.datasets = []
 
         if sapimouse_dir:
+            # SapiMouse不支持lazy（CSV格式）
             self.datasets.append(
                 MouseTrajectoryDataset(
                     sapimouse_dir,
                     dataset_type="sapimouse",
                     max_length=max_length,
                     normalize=normalize,
+                    lazy=False,  # CSV格式不支持lazy
                 )
             )
 
@@ -335,46 +484,80 @@ class CombinedMouseDataset(Dataset):
                         dataset_type="boun_parquet",
                         max_length=max_length,
                         normalize=normalize,
+                        lazy=lazy,
                     )
                 )
             elif list(boun_path.glob("*.jsonl")):
-                # 回退到JSONL格式
+                # 回退到JSONL格式（不支持lazy）
                 self.datasets.append(
                     MouseTrajectoryDataset(
                         boun_dir,
                         dataset_type="boun_jsonl",
                         max_length=max_length,
                         normalize=normalize,
+                        lazy=False,
                     )
                 )
             else:
                 print(f"Warning: No BOUN data found in {boun_dir}")
 
         if open_images_dir:
-            self.datasets.append(
-                MouseTrajectoryDataset(
-                    open_images_dir,
-                    dataset_type="open_images",
-                    max_length=max_length,
-                    normalize=normalize,
+            open_images_path = Path(open_images_dir)
+            # 优先使用 Parquet 格式（支持多个文件）
+            parquet_files = list(open_images_path.glob("*.parquet"))
+            if parquet_files:
+                self.datasets.append(
+                    MouseTrajectoryDataset(
+                        open_images_dir,
+                        dataset_type="open_images_parquet",
+                        max_length=max_length,
+                        normalize=normalize,
+                        lazy=lazy,
+                    )
                 )
-            )
+            elif list(open_images_path.glob("*.jsonl")):
+                # 回退到 JSONL 格式（不支持lazy）
+                self.datasets.append(
+                    MouseTrajectoryDataset(
+                        open_images_dir,
+                        dataset_type="open_images",
+                        max_length=max_length,
+                        normalize=normalize,
+                        lazy=False,
+                    )
+                )
+            else:
+                print(f"Warning: No Open Images data found in {open_images_dir}")
 
-        # 合并所有轨迹
-        self.all_trajectories = []
+        # 构建索引映射 (dataset_idx, local_idx) 或直接合并轨迹
+        self._dataset_offsets = []  # 每个dataset的起始偏移
+        self._total_size = 0
+
         for ds in self.datasets:
-            self.all_trajectories.extend(ds.trajectories)
+            self._dataset_offsets.append(self._total_size)
+            self._total_size += len(ds)
 
-        # 随机采样
-        if max_samples and len(self.all_trajectories) > max_samples:
+        # 如果不是lazy模式，合并所有轨迹到内存（与之前行为一致）
+        if not lazy:
+            self.all_trajectories = []
+            for ds in self.datasets:
+                self.all_trajectories.extend(ds.trajectories)
+            self._total_size = len(self.all_trajectories)
+        else:
+            self.all_trajectories = None  # lazy模式不合并
+
+        # 随机采样（仅非lazy模式）
+        if max_samples and not lazy and len(self.all_trajectories) > max_samples:
             indices = np.random.choice(
                 len(self.all_trajectories),
                 max_samples,
                 replace=False
             )
             self.all_trajectories = [self.all_trajectories[i] for i in indices]
+            self._total_size = len(self.all_trajectories)
 
-        print(f"Combined dataset: {len(self.all_trajectories)} trajectories")
+        mode_str = "lazy" if lazy else "eager"
+        print(f"Combined dataset: {self._total_size} trajectories ({mode_str} mode)")
 
     def _pad_trajectory(self, coords: np.ndarray, length: int) -> Tuple[np.ndarray, np.ndarray]:
         """将轨迹padding到max_length"""
@@ -386,24 +569,50 @@ class CombinedMouseDataset(Dataset):
 
         return padded, mask
 
+    def _find_dataset_and_local_idx(self, global_idx: int) -> Tuple[int, int]:
+        """将全局索引转换为(dataset_idx, local_idx)"""
+        for i in range(len(self._dataset_offsets) - 1, -1, -1):
+            if global_idx >= self._dataset_offsets[i]:
+                return i, global_idx - self._dataset_offsets[i]
+        return 0, global_idx
+
     def __len__(self) -> int:
-        return len(self.all_trajectories)
+        return self._total_size
 
     def __getitem__(self, idx: int) -> dict:
-        coords, length = self.all_trajectories[idx]
+        if self.lazy:
+            # Lazy模式：通过子dataset获取数据
+            ds_idx, local_idx = self._find_dataset_and_local_idx(idx)
+            return self.datasets[ds_idx][local_idx]
+        else:
+            # Eager模式：直接从合并的轨迹列表获取
+            item = self.all_trajectories[idx]
+            if len(item) == 3:
+                coords, length, timestamps = item
+            else:
+                coords, length = item
+                timestamps = None
 
-        padded_traj, mask = self._pad_trajectory(coords, length)
+            padded_traj, mask = self._pad_trajectory(coords, length)
 
-        start_point = coords[0]
-        end_point = coords[-1]
+            start_point = coords[0]
+            end_point = coords[-1]
 
-        return {
-            'trajectory': torch.FloatTensor(padded_traj),
-            'mask': torch.FloatTensor(mask),
-            'start_point': torch.FloatTensor(start_point),
-            'end_point': torch.FloatTensor(end_point),
-            'length': torch.LongTensor([length]),
-        }
+            result = {
+                'trajectory': torch.FloatTensor(padded_traj),
+                'mask': torch.FloatTensor(mask),
+                'start_point': torch.FloatTensor(start_point),
+                'end_point': torch.FloatTensor(end_point),
+                'length': torch.LongTensor([length]),
+            }
+
+            # 添加时间戳（如果有）
+            if timestamps is not None:
+                padded_t = np.zeros(self.max_length, dtype=np.float32)
+                padded_t[:length] = timestamps[:length]
+                result['timestamps'] = torch.FloatTensor(padded_t)
+
+            return result
 
 
 def create_dataloader(
@@ -417,6 +626,7 @@ def create_dataloader(
     max_samples: int = None,
     val_split: float = 0.1,
     return_val: bool = True,
+    lazy: bool = False,
 ) -> Tuple[DataLoader, Optional[DataLoader]]:
     """
     创建数据加载器
@@ -432,6 +642,7 @@ def create_dataloader(
         max_samples: 最大样本数
         val_split: 验证集比例
         return_val: 是否返回验证集
+        lazy: 是否启用懒加载（适合大数据集，节省内存）
 
     Returns:
         (train_loader, val_loader)
@@ -442,6 +653,7 @@ def create_dataloader(
         open_images_dir=open_images_dir,
         max_length=max_length,
         max_samples=max_samples,
+        lazy=lazy,
     )
 
     total_size = len(dataset)

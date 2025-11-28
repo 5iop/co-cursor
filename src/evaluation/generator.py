@@ -61,8 +61,19 @@ class TrajectoryGenerator:
         """加载模型检查点"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
+        # 从检查点读取模型配置（如果有），否则使用默认值
+        model_config = checkpoint.get('model_config', {})
+        seq_length = model_config.get('seq_length', self.seq_length)
+        timesteps = model_config.get('timesteps', 1000)
+        base_channels = model_config.get('base_channels', 64)
+
+        # 更新实例的seq_length以匹配加载的模型
+        self.seq_length = seq_length
+
         model = create_alpha_ddim(
-            seq_length=self.seq_length,
+            seq_length=seq_length,
+            timesteps=timesteps,
+            base_channels=base_channels,
             device=self.device
         )
 

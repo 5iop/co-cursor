@@ -197,6 +197,7 @@ class TrajectoryUNet(nn.Module):
         super().__init__()
         self.seq_length = seq_length
         self.input_dim = input_dim
+        self.base_channels = base_channels
 
         # 时间嵌入
         self.time_mlp = nn.Sequential(
