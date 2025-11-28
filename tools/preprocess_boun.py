@@ -122,6 +122,7 @@ def preprocess_boun(
     output_dir: str,
     min_steps: int = 10,
     clean_output: bool = True,
+    users: List[str] = None,
 ):
     """
     预处理整个BOUN数据集（单线程，PyArrow内部并行）
@@ -131,6 +132,7 @@ def preprocess_boun(
         output_dir: 输出目录
         min_steps: 最小步数阈值
         clean_output: 是否清空输出目录
+        users: 只处理指定的用户ID列表 (如 ["user1", "user2"])，None表示处理所有用户
     """
     input_path = Path(input_dir)
     output_path = Path(output_dir)
@@ -141,9 +143,18 @@ def preprocess_boun(
     output_path.mkdir(parents=True, exist_ok=True)
 
     # 查找所有CSV文件
-    csv_files = list(input_path.glob("users/*/external_tests/*.csv"))
-    csv_files += list(input_path.glob("users/*/internal_tests/*.csv"))
-    csv_files += list(input_path.glob("users/*/training/*.csv"))
+    if users:
+        # 只处理指定用户
+        csv_files = []
+        for user_id in users:
+            csv_files += list(input_path.glob(f"users/{user_id}/external_tests/*.csv"))
+            csv_files += list(input_path.glob(f"users/{user_id}/internal_tests/*.csv"))
+            csv_files += list(input_path.glob(f"users/{user_id}/training/*.csv"))
+        print(f"Filtering by users: {users}")
+    else:
+        csv_files = list(input_path.glob("users/*/external_tests/*.csv"))
+        csv_files += list(input_path.glob("users/*/internal_tests/*.csv"))
+        csv_files += list(input_path.glob("users/*/training/*.csv"))
 
     print(f"Found {len(csv_files)} session files")
 
@@ -338,6 +349,13 @@ def main():
         action="store_true",
         help="Only analyze the dataset without processing"
     )
+    parser.add_argument(
+        "--users",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Only process specific users (e.g., --users user1 user2 user3)"
+    )
 
     args = parser.parse_args()
 
@@ -354,6 +372,7 @@ def main():
             output_dir=str(output_dir),
             min_steps=args.min_steps,
             clean_output=not args.no_clean,
+            users=args.users,
         )
 
 

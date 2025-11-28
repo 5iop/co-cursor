@@ -103,9 +103,23 @@ def main():
     if checkpoint_path.exists():
         print(f"\nLoading model from {checkpoint_path}...")
         checkpoint = torch.load(str(checkpoint_path), map_location=args.device)
-        model = create_alpha_ddim(device=args.device)
+
+        # 从检查点读取模型配置（如果有），否则使用默认值
+        model_config = checkpoint.get('model_config', {})
+        seq_length = model_config.get('seq_length', 500)
+        timesteps = model_config.get('timesteps', 1000)
+        base_channels = model_config.get('base_channels', 64)
+
+        model = create_alpha_ddim(
+            seq_length=seq_length,
+            timesteps=timesteps,
+            base_channels=base_channels,
+            device=args.device
+        )
         model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
         generator = TrajectoryGenerator(model=model, device=args.device)
+        print(f"  Model config: seq_length={seq_length}, timesteps={timesteps}, base_channels={base_channels}")
     else:
         print("\nNo checkpoint found, using untrained model...")
         generator = TrajectoryGenerator(device=args.device)

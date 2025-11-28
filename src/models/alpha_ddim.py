@@ -125,11 +125,11 @@ class AlphaDDIM(nn.Module):
         α-DDIM单步采样 (论文 Eq.4-6)
 
         核心创新: 双协方差混合
-        Σ = α·Σ_d + (1-α)·Σ_n
+        Σ = (1-α)·Σ_d + α·Σ_n
 
-        - Σ_d: 方向协方差 (沿起点到终点方向)
-        - Σ_n: 各向同性噪声协方差
-        - α: 控制复杂度，α大→更多方向性变化，α小→更接近直线
+        - Σ_d: 方向协方差 (沿起点到终点方向) → 产生直线轨迹
+        - Σ_n: 各向同性噪声协方差 → 产生曲线变化
+        - α: 控制复杂度，α大→更多各向同性噪声→更复杂曲线，α小→更接近直线
 
         Args:
             x_t: 当前时刻的噪声数据
@@ -185,16 +185,16 @@ class AlphaDDIM(nn.Module):
         kc_expanded = kc.unsqueeze(1)  # (batch, 1, 1)
         directional_noise = kc_expanded * noise_along * direction_unit_expanded  # (batch, seq, 2)
 
-        # 2. 各向同性噪声 (垂直于轨迹方向)
+        # 2. 各向同性噪声 (随机方向，产生曲线变化)
         isotropic_noise = torch.randn_like(x_t)
 
-        # 论文 Eq.5: Σ = α·Σ_d + (1-α)·Σ_n
-        # α 大: 更多方向性变化 (复杂曲线)
-        # α 小: 更多各向同性噪声 (接近直线但有抖动)
-        mixed_noise = alpha * directional_noise + (1 - alpha) * isotropic_noise
+        # 论文 Eq.5: Σ = (1-α)·Σ_d + α·Σ_n
+        # α 大: 更多各向同性噪声 → 更复杂的曲线
+        # α 小: 更多方向性噪声 → 更接近直线
+        mixed_noise = (1 - alpha) * directional_noise + alpha * isotropic_noise
 
         # 应用混合噪声
-        sigma_t = sigma_base * (0.5 + 0.5 * alpha)  # α 大时噪声更强
+        sigma_t = sigma_base * (0.5 + 0.5 * alpha)  # α 大时噪声更强（更复杂）
 
         # DDIM更新公式
         dir_xt = torch.sqrt(torch.clamp(1 - alpha_t_prev - sigma_t ** 2, min=0)) * predicted_noise
@@ -461,6 +461,7 @@ class AlphaDDIM(nn.Module):
         condition: torch.Tensor,
         t: torch.Tensor = None,
         alpha: torch.Tensor = None,  # 复杂度参数
+        mask: torch.Tensor = None,   # 有效位置掩码
     ) -> dict:
         """
         计算训练损失
@@ -470,6 +471,7 @@ class AlphaDDIM(nn.Module):
             condition: 条件 (batch, 4) - 起点+终点
             t: 时间步 (batch,)
             alpha: 复杂度参数 (batch,) - 从轨迹计算得到
+            mask: 有效位置掩码 (batch, seq_len) - 用于正确计算alpha
 
         Returns:
             包含各项损失的字典
@@ -483,7 +485,7 @@ class AlphaDDIM(nn.Module):
 
         # 如果没有提供alpha，从轨迹计算
         if alpha is None:
-            alpha = self.compute_trajectory_alpha(x_0)
+            alpha = self.compute_trajectory_alpha(x_0, mask)
 
         # 前向扩散
         noise = torch.randn_like(x_0)
@@ -502,7 +504,11 @@ class AlphaDDIM(nn.Module):
             'alpha': alpha,
         }
 
-    def compute_trajectory_alpha(self, trajectory: torch.Tensor) -> torch.Tensor:
+    def compute_trajectory_alpha(
+        self,
+        trajectory: torch.Tensor,
+        mask: torch.Tensor = None
+    ) -> torch.Tensor:
         """
         从轨迹计算复杂度参数α
 
@@ -511,18 +517,48 @@ class AlphaDDIM(nn.Module):
 
         Args:
             trajectory: (batch, seq_len, 2)
+            mask: (batch, seq_len) 有效位置掩码，1表示有效，0表示padding
 
         Returns:
             alpha: (batch,) 范围 [0, 1]
         """
-        # 计算路径长度
-        segments = trajectory[:, 1:, :] - trajectory[:, :-1, :]
-        path_length = torch.norm(segments, dim=-1).sum(dim=-1)  # (batch,)
+        batch_size = trajectory.shape[0]
+        device = trajectory.device
 
-        # 计算直线距离
-        straight_dist = torch.norm(
-            trajectory[:, -1, :] - trajectory[:, 0, :], dim=-1
-        ) + 1e-8  # (batch,)
+        if mask is None:
+            # 无mask时假设全部有效（向后兼容）
+            segments = trajectory[:, 1:, :] - trajectory[:, :-1, :]
+            path_length = torch.norm(segments, dim=-1).sum(dim=-1)
+            straight_dist = torch.norm(
+                trajectory[:, -1, :] - trajectory[:, 0, :], dim=-1
+            ) + 1e-8
+        else:
+            # 使用mask计算真实的路径长度和终点
+            # 计算每个样本的有效长度
+            lengths = mask.sum(dim=-1).long()  # (batch,)
+
+            # 计算段的mask: 只有当前点和下一点都有效时，这个段才有效
+            # segment_mask[i] = mask[i] AND mask[i+1]
+            segment_mask = mask[:, :-1] * mask[:, 1:]  # (batch, seq_len-1)
+
+            # 计算所有段
+            segments = trajectory[:, 1:, :] - trajectory[:, :-1, :]  # (batch, seq_len-1, 2)
+            segment_lengths = torch.norm(segments, dim=-1)  # (batch, seq_len-1)
+
+            # 只累加有效段
+            path_length = (segment_lengths * segment_mask).sum(dim=-1)  # (batch,)
+
+            # 获取真实终点（使用gather按每个样本的有效长度取）
+            # 终点索引是 lengths - 1
+            end_indices = (lengths - 1).clamp(min=0)  # (batch,)
+            end_indices = end_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, 2)  # (batch, 1, 2)
+            end_points = trajectory.gather(1, end_indices).squeeze(1)  # (batch, 2)
+
+            # 起点
+            start_points = trajectory[:, 0, :]  # (batch, 2)
+
+            # 计算直线距离
+            straight_dist = torch.norm(end_points - start_points, dim=-1) + 1e-8  # (batch,)
 
         # 路径长度比率
         ratio = path_length / straight_dist

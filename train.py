@@ -94,6 +94,7 @@ class Trainer:
         train_loader: DataLoader,
         val_loader: DataLoader = None,
         lr: float = 1e-4,
+        num_epochs: int = 100,
         device: str = "cuda",
         checkpoint_dir: str = "checkpoints",
         log_dir: str = "logs",
@@ -136,10 +137,11 @@ class Trainer:
             weight_decay=0.01,
         )
 
-        # 学习率调度器 (T_max 会在恢复训练时重新设置)
+        # 学习率调度器
+        self.num_epochs = num_epochs
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
-            T_max=100,  # 默认值，恢复训练时会更新
+            T_max=num_epochs,
             eta_min=1e-6,
         )
 
@@ -180,11 +182,13 @@ class Trainer:
             condition = torch.cat([start_point, end_point], dim=1)
             batch_size = trajectory.shape[0]
 
-            # 随机采样α (论文核心: 模型学习按指定α生成轨迹)
-            # 论文推荐范围: 0.3-0.8
-            # α=0.3: 简单轨迹 (接近直线)
-            # α=0.8: 复杂轨迹 (更多曲线变化)
-            alpha = 0.3 + 0.5 * torch.rand(batch_size, device=self.device)  # [0.3, 0.8]
+            # 从轨迹计算真实的复杂度α (而非随机采样)
+            # 这确保 style loss 学习正确的 α → 复杂度映射
+            # α 基于路径长度比率: α = clamp((path_length/straight_dist - 1) / 2, 0, 1)
+            # 必须传入mask以忽略padding部分，否则会错误计算终点和路径长度
+            alpha = self.model_raw.compute_trajectory_alpha(trajectory, mask)
+            # 约束到论文推荐范围 [0.3, 0.8]
+            alpha = 0.3 + 0.5 * alpha  # 映射 [0,1] -> [0.3, 0.8]
 
             # 随机采样时间步（使用原始模型引用访问属性）
             t = torch.randint(0, self.model_raw.timesteps, (batch_size,), device=self.device)
@@ -261,8 +265,10 @@ class Trainer:
             condition = torch.cat([start_point, end_point], dim=1)
             batch_size = trajectory.shape[0]
 
-            # 随机采样α (论文推荐范围 0.3-0.8)
-            alpha = 0.3 + 0.5 * torch.rand(batch_size, device=self.device)
+            # 从轨迹计算真实的复杂度α (与训练一致)
+            # 必须传入mask以忽略padding部分
+            alpha = self.model_raw.compute_trajectory_alpha(trajectory, mask)
+            alpha = 0.3 + 0.5 * alpha  # 映射 [0,1] -> [0.3, 0.8]
             t = torch.randint(0, self.model_raw.timesteps, (batch_size,), device=self.device)
 
             noise = torch.randn_like(trajectory)
@@ -335,25 +341,54 @@ class Trainer:
         torch.save(checkpoint, path)
         print(f"Checkpoint saved to {path}")
 
-    def load_checkpoint(self, path: str):
-        """加载检查点"""
+    def load_checkpoint(self, path: str, total_epochs: int = None):
+        """
+        加载检查点
+
+        Args:
+            path: 检查点路径
+            total_epochs: 总训练轮数（用于重新计算 LR scheduler）
+                         如果为 None，使用 Trainer 初始化时的 num_epochs
+        """
         checkpoint = torch.load(path, map_location=self.device)
 
         self.model_raw.load_state_dict(checkpoint['model_state_dict'])
-
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
         self.epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
         self.best_loss = checkpoint['best_loss']
         self.train_losses = checkpoint.get('train_losses', [])
 
-        print(f"Loaded checkpoint from {path}, epoch {self.epoch}")
+        # 重新创建 scheduler 以匹配目标总轮数
+        # 这避免了 T_max 不匹配导致的 LR 衰减过快/过慢问题
+        target_epochs = total_epochs if total_epochs else self.num_epochs
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=target_epochs,
+            eta_min=1e-6,
+            last_epoch=self.epoch,  # 从当前 epoch 继续
+        )
 
-    def train(self, num_epochs: int):
-        """完整训练流程"""
+        print(f"Loaded checkpoint from {path}, epoch {self.epoch}")
+        print(f"LR scheduler reset with T_max={target_epochs}, last_epoch={self.epoch}")
+
+    def train(self, num_epochs: int = None):
+        """
+        完整训练流程
+
+        Args:
+            num_epochs: 目标总轮数（非附加轮数）。如果为 None，使用初始化时的 num_epochs
+                       例如：resume 在 epoch 50，num_epochs=100 表示训练到 epoch 100
+        """
+        target_epochs = num_epochs if num_epochs else self.num_epochs
         start_epoch = self.epoch  # 从当前epoch继续（恢复训练时不为0）
-        end_epoch = start_epoch + num_epochs
+        end_epoch = target_epochs
+
+        if start_epoch >= end_epoch:
+            if is_main_process():
+                print(f"Already at epoch {start_epoch}, target is {end_epoch}. Nothing to do.")
+            return
 
         if is_main_process():
             print(f"Starting training from epoch {start_epoch + 1} to {end_epoch}")
@@ -684,6 +719,7 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         lr=args.lr,
+        num_epochs=args.num_epochs,  # 传入总轮数以正确设置 LR scheduler
         device=device,  # 使用 DDP 设置的设备
         checkpoint_dir=args.checkpoint_dir,
         # 损失权重 (论文 Eq.14)
@@ -694,7 +730,8 @@ def main():
 
     # 恢复训练
     if args.resume:
-        trainer.load_checkpoint(args.resume)
+        # 传入 total_epochs 以正确重置 LR scheduler
+        trainer.load_checkpoint(args.resume, total_epochs=args.num_epochs)
 
     # ==================== 开始训练 ====================
     try:

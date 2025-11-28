@@ -89,13 +89,62 @@ def load_real_trajectories(
     )
 
 
+def estimate_generated_masks(
+    trajectories: np.ndarray,
+    end_points: np.ndarray,
+    threshold: float = 0.02,
+    min_length: int = 10,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """估计生成轨迹的有效长度和mask
+
+    基于轨迹何时首次到达终点附近来估计有效长度。
+    这解决了训练时使用mask但评估时不使用导致的指标失真问题。
+
+    Args:
+        trajectories: (N, seq_len, 2) 生成的轨迹
+        end_points: (N, 2) 目标终点
+        threshold: 判定到达终点的距离阈值（归一化坐标）
+        min_length: 最小有效长度
+
+    Returns:
+        masks: (N, seq_len) 有效位置掩码
+        lengths: (N,) 估计的有效长度
+    """
+    batch_size, seq_len, _ = trajectories.shape
+    masks = np.zeros((batch_size, seq_len), dtype=np.float32)
+    lengths = np.zeros(batch_size, dtype=np.int32)
+
+    for i in range(batch_size):
+        traj = trajectories[i]  # (seq_len, 2)
+        end_pt = end_points[i]  # (2,)
+
+        # 计算每个点到终点的距离
+        distances = np.linalg.norm(traj - end_pt, axis=1)
+
+        # 找到第一次到达终点附近的位置
+        reached_indices = np.where(distances < threshold)[0]
+
+        if len(reached_indices) > 0:
+            # 使用第一次到达终点的位置作为有效长度
+            effective_length = max(reached_indices[0] + 1, min_length)
+        else:
+            # 如果从未到达终点，使用整个轨迹
+            effective_length = seq_len
+
+        effective_length = min(effective_length, seq_len)
+        lengths[i] = effective_length
+        masks[i, :effective_length] = 1.0
+
+    return masks, lengths
+
+
 def generate_trajectories(
     generator: TrajectoryGenerator,
     start_points: np.ndarray,
     end_points: np.ndarray,
     alpha: float = 0.5,
     num_samples: int = None,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """使用模型生成轨迹
 
     Args:
@@ -104,6 +153,11 @@ def generate_trajectories(
         end_points: (N, 2) 真实终点
         alpha: 复杂度参数
         num_samples: 生成样本数
+
+    Returns:
+        generated: (N, seq_len, 2) 生成的轨迹
+        masks: (N, seq_len) 估计的有效位置掩码
+        selected_ends: (N, 2) 使用的终点（用于mask估计）
     """
     if num_samples is None:
         num_samples = len(start_points)
@@ -116,7 +170,7 @@ def generate_trajectories(
     selected_starts = start_points[indices]
     selected_ends = end_points[indices]
 
-    print(f"Generating {num_samples} trajectories with alpha={alpha}...")
+    print(f"Generating {actual_samples} trajectories with alpha={alpha}...")
     generated = generator.generate_batch(
         start_points=selected_starts,
         end_points=selected_ends,
@@ -125,7 +179,12 @@ def generate_trajectories(
         return_normalized=True,
     )
 
-    return generated
+    # 估计生成轨迹的有效mask
+    masks, lengths = estimate_generated_masks(generated, selected_ends)
+    avg_length = lengths.mean()
+    print(f"  Estimated average trajectory length: {avg_length:.1f}")
+
+    return generated, masks, selected_ends
 
 
 def evaluate_distribution(
@@ -173,7 +232,7 @@ def compare_baselines(
     num_samples: int = 100,
     alpha: float = 0.5,
     seq_length: int = 500,
-) -> dict:
+) -> Tuple[dict, dict, np.ndarray]:
     """与基线方法对比
 
     Args:
@@ -183,8 +242,14 @@ def compare_baselines(
         num_samples: 生成样本数
         alpha: 复杂度参数
         seq_length: 轨迹序列长度（与DMTG保持一致）
+
+    Returns:
+        trajectories: 各方法生成的轨迹 {method_name: (N, seq_len, 2)}
+        masks: 各方法的轨迹mask {method_name: (N, seq_len)}
+        selected_ends: 使用的终点 (N, 2)
     """
-    results = {}
+    trajectories = {}
+    masks = {}
 
     # 选择样本（确保不超过可用样本数）
     actual_samples = min(num_samples, len(start_points))
@@ -202,25 +267,29 @@ def compare_baselines(
         normalized_input=True,
         return_normalized=True,
     )
-    results['DMTG'] = dmtg_trajectories
+    trajectories['DMTG'] = dmtg_trajectories
+    dmtg_masks, _ = estimate_generated_masks(dmtg_trajectories, selected_ends)
+    masks['DMTG'] = dmtg_masks
 
-    # 2. Bezier（与DMTG使用相同序列长度）
+    # 2. Bezier（与DMTG使用相同序列长度，全长有效）
     print("Generating Bezier trajectories...")
     bezier_trajectories = []
     for start, end in zip(selected_starts, selected_ends):
         traj = BezierGenerator.generate(tuple(start), tuple(end), num_points=seq_length)
         bezier_trajectories.append(traj)
-    results['Bezier'] = np.array(bezier_trajectories)
+    trajectories['Bezier'] = np.array(bezier_trajectories)
+    masks['Bezier'] = np.ones((actual_samples, seq_length), dtype=np.float32)
 
-    # 3. Linear（与DMTG使用相同序列长度）
+    # 3. Linear（与DMTG使用相同序列长度，全长有效）
     print("Generating Linear trajectories...")
     linear_trajectories = []
     for start, end in zip(selected_starts, selected_ends):
         traj = LinearGenerator.generate(tuple(start), tuple(end), num_points=seq_length, noise_level=0.01)
         linear_trajectories.append(traj)
-    results['Linear'] = np.array(linear_trajectories)
+    trajectories['Linear'] = np.array(linear_trajectories)
+    masks['Linear'] = np.ones((actual_samples, seq_length), dtype=np.float32)
 
-    return results
+    return trajectories, masks, selected_ends
 
 
 def main():
@@ -314,7 +383,7 @@ def main():
         generator = TrajectoryGenerator(device=args.device)
 
     # 生成轨迹
-    generated_trajectories = generate_trajectories(
+    generated_trajectories, generated_masks, _ = generate_trajectories(
         generator,
         real_start_points,
         real_end_points,
@@ -326,11 +395,12 @@ def main():
     print("\n" + "=" * 40)
     print("Distribution Metrics")
     print("=" * 40)
+    num_eval = len(generated_trajectories)
     dist_results = evaluate_distribution(
         generated_trajectories,
-        real_trajectories[:args.num_samples],
-        generated_masks=None,  # 生成轨迹是完整500点，无需mask
-        real_masks=real_masks[:args.num_samples],
+        real_trajectories[:num_eval],
+        generated_masks=generated_masks,
+        real_masks=real_masks[:num_eval],
     )
     for name, value in dist_results.items():
         print(f"  {name}: {value:.6f}")
@@ -341,9 +411,9 @@ def main():
     print("=" * 40)
     clf_results = evaluate_classifiers(
         generated_trajectories,
-        real_trajectories[:args.num_samples],
-        generated_masks=None,
-        real_masks=real_masks[:args.num_samples],
+        real_trajectories[:num_eval],
+        generated_masks=generated_masks,
+        real_masks=real_masks[:num_eval],
     )
     for clf_name, scores in clf_results.items():
         print(f"\n  {clf_name}:")
@@ -356,20 +426,24 @@ def main():
         print("Baseline Comparison")
         print("=" * 40)
 
-        baseline_trajectories = compare_baselines(
+        baseline_num = min(100, args.num_samples)
+        baseline_trajectories, baseline_masks, _ = compare_baselines(
             real_start_points,
             real_end_points,
             generator,
-            num_samples=min(100, args.num_samples),
+            num_samples=baseline_num,
             alpha=args.alpha,
         )
 
         baseline_results = {}
         for method_name, trajectories in baseline_trajectories.items():
             print(f"\n  Evaluating {method_name}...")
+            method_mask = baseline_masks[method_name]
             metrics = evaluate_distribution(
                 trajectories,
-                real_trajectories[:len(trajectories)]
+                real_trajectories[:len(trajectories)],
+                generated_masks=method_mask,
+                real_masks=real_masks[:len(trajectories)],
             )
             baseline_results[method_name] = metrics
 

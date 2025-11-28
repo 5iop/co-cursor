@@ -1,6 +1,6 @@
 """
 鼠标轨迹数据可视化工具
-支持CSV和JSONL格式（preprocess_boun.py处理后的数据）
+支持CSV、JSONL和Parquet格式
 优化大文件加载，支持归一化数据自动检测
 """
 import sys
@@ -10,6 +10,7 @@ import orjson
 from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 import numpy as np
+import pyarrow.parquet as pq
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -56,7 +57,7 @@ class TrajectoryVisualizer:
         control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
 
         # 文件选择按钮
-        ttk.Button(control_frame, text="选择文件(CSV/JSONL)", command=self._select_file).pack(fill=tk.X, pady=5)
+        ttk.Button(control_frame, text="选择文件", command=self._select_file).pack(fill=tk.X, pady=5)
         ttk.Button(control_frame, text="选择文件夹", command=self._select_folder).pack(fill=tk.X, pady=5)
 
         # 分隔线
@@ -153,14 +154,14 @@ class TrajectoryVisualizer:
             if hasattr(self.root, 'drop_target_register'):
                 self.root.drop_target_register(DND_FILES)
                 self.root.dnd_bind('<<Drop>>', self._on_drop)
-                self.status_var.set("请选择文件或拖拽CSV/JSONL文件到窗口")
+                self.status_var.set("请选择文件或拖拽 Parquet/CSV/JSONL 文件到窗口")
         except ImportError:
-            self.status_var.set("请选择CSV/JSONL文件（安装tkinterdnd2可支持拖拽）")
+            self.status_var.set("请选择 Parquet/CSV/JSONL 文件（安装tkinterdnd2可支持拖拽）")
 
     def _on_drop(self, event):
         """处理拖拽事件"""
         files = self.root.tk.splitlist(event.data)
-        supported_files = [f for f in files if f.lower().endswith(('.csv', '.jsonl'))]
+        supported_files = [f for f in files if f.lower().endswith(('.csv', '.jsonl', '.parquet'))]
         if supported_files:
             self._load_files(supported_files)
 
@@ -169,7 +170,8 @@ class TrajectoryVisualizer:
         files = filedialog.askopenfilenames(
             title="选择数据文件",
             filetypes=[
-                ("数据文件", "*.csv *.jsonl"),
+                ("数据文件", "*.csv *.jsonl *.parquet"),
+                ("Parquet files", "*.parquet"),
                 ("CSV files", "*.csv"),
                 ("JSONL files", "*.jsonl"),
                 ("All files", "*.*")
@@ -183,11 +185,15 @@ class TrajectoryVisualizer:
         folder = filedialog.askdirectory(title="选择包含数据文件的文件夹")
         if folder:
             folder_path = Path(folder)
-            data_files = list(folder_path.glob("**/*.csv")) + list(folder_path.glob("**/*.jsonl"))
+            data_files = (
+                list(folder_path.glob("**/*.parquet")) +
+                list(folder_path.glob("**/*.csv")) +
+                list(folder_path.glob("**/*.jsonl"))
+            )
             if data_files:
                 self._load_files([str(f) for f in data_files[:50]])
             else:
-                messagebox.showwarning("警告", "文件夹中没有找到CSV或JSONL文件")
+                messagebox.showwarning("警告", "文件夹中没有找到支持的数据文件")
 
     def _show_progress(self, show=True):
         """显示/隐藏进度条"""
@@ -236,7 +242,10 @@ class TrajectoryVisualizer:
                 self._update_progress(file_progress, f"正在加载大文件: {Path(file_path).name} ({file_size_mb:.1f}MB)")
 
             # 根据扩展名选择处理方法
-            if file_path.lower().endswith('.jsonl'):
+            if file_path.lower().endswith('.parquet'):
+                trajs, file_total = self._process_parquet(file_path, is_large_file)
+                self.total_available += file_total
+            elif file_path.lower().endswith('.jsonl'):
                 trajs, file_total = self._process_jsonl(file_path, is_large_file)
                 self.total_available += file_total
             else:
@@ -325,6 +334,73 @@ class TrajectoryVisualizer:
         except Exception as e:
             print(f"Error processing {file_path}: {e}")
             return []
+
+    def _process_parquet(self, file_path: str, is_large_file: bool = False) -> Tuple[List[dict], int]:
+        """
+        处理Parquet文件（新格式：x, y, t 列表格式）
+
+        Returns:
+            (轨迹列表, 文件中总轨迹数)
+        """
+        results = []
+        total_count = 0
+
+        try:
+            table = pq.read_table(file_path)
+            total_count = len(table)
+
+            if 'x' not in table.column_names or 'y' not in table.column_names:
+                print(f"Parquet file {file_path} missing x/y columns")
+                return [], 0
+
+            x_col = table.column('x')
+            y_col = table.column('y')
+
+            for i in range(len(table)):
+                # 大文件时更新进度
+                if is_large_file and i % 1000 == 0:
+                    progress = (i / len(table)) * 100
+                    self._update_progress(progress,
+                        f"处理 {Path(file_path).name}: {progress:.0f}% ({len(results)} 轨迹)")
+
+                # 如果已达到最大数量，跳过
+                if len(results) >= self.max_trajectories:
+                    continue
+
+                x_list = x_col[i].as_py()
+                y_list = y_col[i].as_py()
+
+                if len(x_list) < self.min_trajectory_length:
+                    continue
+
+                raw_traj = np.column_stack([x_list, y_list]).astype(np.float32)
+
+                # 检测是否已归一化（Parquet数据通常已归一化）
+                coord_max = raw_traj.max()
+                coord_min = raw_traj.min()
+                coord_median = np.median(raw_traj)
+                is_normalized = (coord_max <= 1.5 and coord_min >= -0.5 and
+                                0.0 <= coord_median <= 1.0)
+
+                resampled = self._resample(raw_traj, self.seq_length)
+
+                # 如果是归一化数据，裁剪到[0, 1]范围
+                if is_normalized:
+                    resampled = np.clip(resampled, 0.0, 1.0)
+
+                results.append({
+                    'data': resampled,
+                    'is_normalized': is_normalized,
+                    'metadata': {
+                        'trajectory_id': i,
+                    }
+                })
+
+            return results, total_count
+
+        except Exception as e:
+            print(f"Error processing Parquet {file_path}: {e}")
+            return [], 0
 
     def _process_jsonl(self, file_path: str, is_large_file: bool = False) -> Tuple[List[dict], int]:
         """

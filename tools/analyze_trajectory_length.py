@@ -1,43 +1,74 @@
 """
 轨迹长度分布分析脚本
 用于检查数据集中每个轨迹包含多少点，帮助决定mask长度
-支持多线程加速
+支持 Parquet/CSV 格式，使用 PyArrow 读取
 """
 import argparse
-
-import orjson
 import numpy as np
+import pyarrow.parquet as pq
+import pyarrow.csv as pv
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-NUM_THREADS = 16
+DISTANCE_THRESHOLD = 100.0  # SapiMouse 轨迹分割阈值
 
 
-def analyze_jsonl_file(file_path: Path) -> list:
-    """分析单个JSONL文件，返回所有轨迹的点数列表"""
+def analyze_parquet_file(file_path: Path) -> list:
+    """分析单个Parquet文件（新格式：x, y 为 list 列）"""
     point_counts = []
 
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
+        table = pq.read_table(file_path, columns=['x'])
+        x_col = table.column('x')
 
-                try:
-                    record = orjson.loads(line)
-                    traces = record.get('traces', [])
-
-                    for trace in traces:
-                        if trace:
-                            point_counts.append(len(trace))
-
-                except orjson.JSONDecodeError:
-                    continue
+        for i in range(len(table)):
+            x_list = x_col[i].as_py()
+            if x_list:
+                point_counts.append(len(x_list))
 
     except Exception as e:
         print(f"Error reading {file_path}: {e}")
+
+    return point_counts
+
+
+def analyze_csv_file(file_path: Path, min_length: int = 10) -> list:
+    """分析单个SapiMouse CSV文件，按距离分割轨迹"""
+    point_counts = []
+
+    try:
+        table = pv.read_csv(
+            file_path,
+            read_options=pv.ReadOptions(use_threads=True),
+            convert_options=pv.ConvertOptions(
+                include_columns=['x', 'y', 'state']
+            )
+        )
+
+        x = table.column('x').to_numpy()
+        y = table.column('y').to_numpy()
+        states = table.column('state').to_pylist()
+
+        # 只保留Move事件
+        move_mask = np.array([s == 'Move' for s in states])
+        coords = np.column_stack([x[move_mask], y[move_mask]])
+
+        if len(coords) < 2:
+            return point_counts
+
+        # 按距离分割轨迹
+        diffs = np.diff(coords, axis=0)
+        distances = np.linalg.norm(diffs, axis=1)
+        split_indices = np.where(distances > DISTANCE_THRESHOLD)[0] + 1
+        split_indices = np.concatenate([[0], split_indices, [len(coords)]])
+
+        for i in range(len(split_indices) - 1):
+            length = split_indices[i + 1] - split_indices[i]
+            if length >= min_length:
+                point_counts.append(length)
+
+    except Exception:
+        pass  # 静默处理错误
 
     return point_counts
 
@@ -86,32 +117,61 @@ def print_distribution(point_counts: list, dataset_name: str):
     print(f"  激进 (覆盖95%): {int(np.percentile(counts, 95))}")
 
 
-def analyze_dataset(data_dir: Path, dataset_name: str, num_threads: int = NUM_THREADS) -> list:
-    """分析整个数据集目录（多线程）"""
-    jsonl_files = list(data_dir.glob("**/*.jsonl"))
+def analyze_dataset(data_dir: Path, dataset_name: str, file_type: str = "auto") -> list:
+    """
+    分析整个数据集目录
 
-    if not jsonl_files:
-        print(f"在 {data_dir} 中没有找到JSONL文件")
+    Args:
+        data_dir: 数据集目录
+        dataset_name: 数据集名称
+        file_type: 文件类型 ("parquet", "csv", "auto")
+    """
+    # 根据文件类型查找文件
+    if file_type == "auto":
+        parquet_files = list(data_dir.glob("**/*.parquet"))
+        csv_files = list(data_dir.glob("**/*.csv"))
+
+        if parquet_files:
+            files, analyze_func, file_type_name = parquet_files, analyze_parquet_file, "Parquet"
+        elif csv_files:
+            files, analyze_func, file_type_name = csv_files, analyze_csv_file, "CSV"
+        else:
+            print(f"在 {data_dir} 中没有找到数据文件")
+            return []
+    elif file_type == "parquet":
+        files = list(data_dir.glob("**/*.parquet"))
+        analyze_func, file_type_name = analyze_parquet_file, "Parquet"
+    elif file_type == "csv":
+        files = list(data_dir.glob("**/*.csv"))
+        analyze_func, file_type_name = analyze_csv_file, "CSV"
+    else:
+        print(f"未知文件类型: {file_type}")
+        return []
+
+    if not files:
+        print(f"在 {data_dir} 中没有找到 {file_type_name} 文件")
         return []
 
     print(f"\n正在分析 {dataset_name}...")
-    print(f"找到 {len(jsonl_files)} 个JSONL文件，使用 {num_threads} 线程")
+    print(f"找到 {len(files)} 个 {file_type_name} 文件")
 
     all_counts = []
 
-    # 多线程并行处理
-    with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        futures = {executor.submit(analyze_jsonl_file, f): f for f in jsonl_files}
-
-        for future in tqdm(as_completed(futures), total=len(futures), desc="读取文件"):
-            counts = future.result()
-            all_counts.extend(counts)
+    for file_path in tqdm(files, desc="读取文件"):
+        counts = analyze_func(file_path)
+        all_counts.extend(counts)
 
     return all_counts
 
 
 def main():
     parser = argparse.ArgumentParser(description="分析轨迹长度分布")
+    parser.add_argument(
+        "--sapimouse",
+        type=str,
+        default="datasets/sapimouse",
+        help="SapiMouse数据集目录"
+    )
     parser.add_argument(
         "--boun",
         type=str,
@@ -131,12 +191,6 @@ def main():
         help="自定义数据集目录"
     )
     parser.add_argument(
-        "--threads",
-        type=int,
-        default=NUM_THREADS,
-        help=f"线程数 (默认: {NUM_THREADS})"
-    )
-    parser.add_argument(
         "--all",
         action="store_true",
         help="分析所有数据集的合并统计"
@@ -150,10 +204,21 @@ def main():
     all_counts = []
     datasets_analyzed = []
 
+    # 分析SapiMouse数据集
+    sapimouse_path = base_dir / args.sapimouse
+    if sapimouse_path.exists():
+        counts = analyze_dataset(sapimouse_path, "SapiMouse", file_type="csv")
+        if counts:
+            print_distribution(counts, "SapiMouse")
+            all_counts.extend(counts)
+            datasets_analyzed.append("SapiMouse")
+    else:
+        print(f"SapiMouse目录不存在: {sapimouse_path}")
+
     # 分析BOUN数据集
     boun_path = base_dir / args.boun
     if boun_path.exists():
-        counts = analyze_dataset(boun_path, "BOUN (处理后)", args.threads)
+        counts = analyze_dataset(boun_path, "BOUN (处理后)")
         if counts:
             print_distribution(counts, "BOUN (处理后)")
             all_counts.extend(counts)
@@ -164,7 +229,7 @@ def main():
     # 分析Open Images数据集
     open_images_path = base_dir / args.open_images
     if open_images_path.exists():
-        counts = analyze_dataset(open_images_path, "Open Images V6", args.threads)
+        counts = analyze_dataset(open_images_path, "Open Images V6")
         if counts:
             print_distribution(counts, "Open Images V6")
             all_counts.extend(counts)
@@ -176,7 +241,7 @@ def main():
     if args.custom:
         custom_path = base_dir / args.custom
         if custom_path.exists():
-            counts = analyze_dataset(custom_path, f"自定义 ({custom_path.name})", args.threads)
+            counts = analyze_dataset(custom_path, f"自定义 ({custom_path.name})")
             if counts:
                 print_distribution(counts, f"自定义 ({custom_path.name})")
                 all_counts.extend(counts)
