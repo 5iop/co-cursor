@@ -26,6 +26,50 @@ class SinusoidalPositionEmbeddings(nn.Module):
         return embeddings
 
 
+class DiscreteAlphaEmbedding(nn.Module):
+    """
+    离散α风格嵌入 (论文 Eq.10)
+
+    将连续的α值离散化为S个bin，使用位置编码嵌入
+    论文中α = 1/(β+1)，β是理论复杂度
+    """
+
+    def __init__(self, num_bins: int = 10, embedding_dim: int = 128):
+        super().__init__()
+        self.num_bins = num_bins
+        self.embedding_dim = embedding_dim
+
+        # 离散bin的嵌入表
+        self.embedding = nn.Embedding(num_bins, embedding_dim)
+
+        # 投影层
+        self.proj = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.SiLU(),
+            nn.Linear(embedding_dim, embedding_dim),
+        )
+
+    def forward(self, alpha: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            alpha: 连续α值 (batch,) 或 (batch, 1)，范围 [0, 1]
+        Returns:
+            嵌入向量 (batch, embedding_dim)
+        """
+        if alpha.dim() == 2:
+            alpha = alpha.squeeze(-1)
+
+        # 将α离散化为bin索引
+        # α ∈ [0, 1] -> bin ∈ [0, num_bins-1]
+        bin_idx = (alpha * (self.num_bins - 1)).long().clamp(0, self.num_bins - 1)
+
+        # 获取嵌入
+        emb = self.embedding(bin_idx)
+
+        # 投影
+        return self.proj(emb)
+
+
 class ConvBlock(nn.Module):
     """卷积块，包含两个卷积层和GroupNorm"""
 
@@ -215,10 +259,10 @@ class TrajectoryUNet(nn.Module):
         )
 
         # α (复杂度/风格) 嵌入 - 论文Eq.10
-        self.alpha_mlp = nn.Sequential(
-            nn.Linear(1, time_emb_dim),
-            nn.SiLU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
+        # 使用离散bin嵌入，而非连续MLP
+        self.alpha_embedding = DiscreteAlphaEmbedding(
+            num_bins=10,  # S=10 个风格bin
+            embedding_dim=time_emb_dim
         )
 
         # 输入投影
@@ -293,11 +337,9 @@ class TrajectoryUNet(nn.Module):
             cond_emb = self.condition_mlp(condition)
             time_emb = time_emb + cond_emb
 
-        # α 嵌入 - 论文Eq.10的关键
+        # α 嵌入 - 论文Eq.10: 离散bin嵌入
         if alpha is not None:
-            if alpha.dim() == 1:
-                alpha = alpha.unsqueeze(-1)  # (batch,) -> (batch, 1)
-            alpha_emb = self.alpha_mlp(alpha)
+            alpha_emb = self.alpha_embedding(alpha)
             time_emb = time_emb + alpha_emb
 
         # 输入投影

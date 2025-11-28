@@ -167,13 +167,17 @@ class DMTGLoss(nn.Module):
         # MST 比率
         mst_ratio = path_length / straight_dist  # (batch,)
 
-        # 论文 Eq.8-9: 将 MST 比率归一化为复杂度 [0, 1]
+        # 论文 Eq.8-9: 使用 β/(β+1) 公式计算复杂度
+        # β = mst_ratio - 1 (曲线相对于直线的额外长度比)
+        # complexity = β / (β + 1) = (mst_ratio - 1) / mst_ratio
         # ratio=1 (直线) -> complexity=0
-        # ratio=3 (复杂曲线) -> complexity=1
-        pred_complexity = torch.clamp((mst_ratio - 1.0) / 2.0, 0.0, 1.0)
+        # ratio→∞ (极复杂) -> complexity→1
+        beta = mst_ratio - 1.0
+        pred_complexity = beta / (beta + 1.0 + 1e-8)
+        pred_complexity = torch.clamp(pred_complexity, 0.0, 1.0)
 
         # Lstyle = ||α - C(p_a)||²
-        # α 直接作为目标复杂度，与 MST 复杂度比较
+        # α = 1/(β+1) 是论文的理论复杂度输入
         style_loss = F.mse_loss(pred_complexity, alpha)
 
         return style_loss

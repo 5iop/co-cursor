@@ -91,13 +91,13 @@ class TrajectoryGenerator:
         return_normalized: bool = False,
     ) -> np.ndarray:
         """
-        生成单条轨迹 (论文 α-DDIM)
+        生成单条轨迹
 
         Args:
             start_point: 起点坐标 (x, y)
             end_point: 终点坐标 (x, y)
-            alpha: 目标复杂度 (论文推荐 0.3-0.8)
-            num_inference_steps: 最大推理步数
+            alpha: 复杂度参数 ∈ [0.3, 0.8]
+            num_inference_steps: 推理步数
             normalized_input: 输入坐标是否已归一化
             return_normalized: 是否返回归一化的坐标
 
@@ -123,8 +123,7 @@ class TrajectoryGenerator:
             start[0], start[1], end[0], end[1]
         ]).unsqueeze(0).to(self.device)
 
-        # 生成 - α-DDIM 采样 (论文 Eq.4-9)
-        # α 直接作为目标复杂度，内置熵控制保证停止
+        # 生成
         trajectory = self.model.sample(
             batch_size=1,
             condition=condition,
@@ -153,13 +152,13 @@ class TrajectoryGenerator:
         return_normalized: bool = False,
     ) -> np.ndarray:
         """
-        批量生成轨迹 (论文 α-DDIM)
+        批量生成轨迹
 
         Args:
             start_points: 起点数组 (batch, 2)
             end_points: 终点数组 (batch, 2)
-            alpha: 目标复杂度 (论文推荐 0.3-0.8)
-            num_inference_steps: 最大推理步数
+            alpha: 复杂度参数 ∈ [0.3, 0.8]
+            num_inference_steps: 推理步数
             normalized_input: 输入坐标是否已归一化
             return_normalized: 是否返回归一化的坐标
 
@@ -182,7 +181,7 @@ class TrajectoryGenerator:
             np.concatenate([start_points, end_points], axis=1)
         ).to(self.device)
 
-        # 生成 - α-DDIM 采样 (论文 Eq.4-9)
+        # 生成
         trajectories = self.model.sample(
             batch_size=batch_size,
             condition=condition,
@@ -205,10 +204,10 @@ class TrajectoryGenerator:
         start_point: Tuple[float, float],
         end_point: Tuple[float, float],
         num_samples: int = 5,
-        alpha_range: Tuple[float, float] = (0.3, 0.8),  # 论文推荐范围
+        alpha_range: Tuple[float, float] = (0.3, 0.8),
     ) -> List[np.ndarray]:
         """
-        生成不同复杂度的轨迹 (论文推荐 α ∈ [0.3, 0.8])
+        生成不同复杂度的轨迹
 
         Args:
             start_point: 起点

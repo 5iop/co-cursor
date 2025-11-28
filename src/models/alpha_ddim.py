@@ -180,12 +180,12 @@ class AlphaDDIM(nn.Module):
         sigma_base = torch.sqrt(torch.clamp(sigma_squared, min=0))
 
         # ========== 从混合协方差采样 ==========
-        # 论文 Eq.4: z_d ~ N(0, Σ_d) 其中 Σ_d = k_c·||d||·(d̂⊗d̂)
-        # 方向协方差是秩1矩阵，采样为: z_d = √(k_c·||d||) · ε_1 · d̂
+        # 论文 Eq.4: z_d ~ N(0, Σ_d) 其中 Σ_d = (k_c·||d||)²·(d̂⊗d̂)
+        # 方向协方差是秩1矩阵，采样为: z_d = (k_c·||d||) · ε_1 · d̂
         # 其中 ε_1 ~ N(0, 1) 是标量
         noise_scalar = torch.randn(batch_size, self.seq_length, 1, device=x_t.device)
         direction_unit_expanded = direction_unit.unsqueeze(1)  # (batch, 1, 2)
-        sigma_d = torch.sqrt(kc * direction_norm).unsqueeze(1)  # (batch, 1, 1)
+        sigma_d = (kc * direction_norm).unsqueeze(1)  # (batch, 1, 1) - 直接使用，不取sqrt
         z_d = sigma_d * noise_scalar * direction_unit_expanded  # (batch, seq, 2)
 
         # 论文 Eq.5: z_n ~ N(0, Σ_n) 其中 Σ_n = σ²_n·I
@@ -245,8 +245,10 @@ class AlphaDDIM(nn.Module):
         """
         self.model.eval()
 
-        # 约束 α 到论文推荐范围 (采样时)
-        alpha_clamped = max(0.3, min(0.8, alpha))
+        # 论文 Eq.10: α ∈ [0, 1] 全范围支持
+        # α = 0: 简单直线轨迹
+        # α = 1: 最复杂曲线轨迹
+        alpha_clamped = max(0.0, min(1.0, alpha))
 
         # 论文 Eq.2-3: 掩码初始化，支持距离缩放噪声和可控长度
         x = self._initialize_with_condition(
@@ -325,8 +327,8 @@ class AlphaDDIM(nn.Module):
         - X_c: 条件点 (起点和终点)
         - ε: 高斯噪声，标准差按起终点距离缩放 (论文 Eq.3)
 
-        论文 Eq.3: σ_ε = k_σ · ||p_m - p_0|| / √(m-1)
-        其中 k_σ 是缩放常数，这里使用 0.5
+        论文 Eq.3: σ_ε = k_c · ||p_m - p_0|| / √(m-1)
+        其中 k_c ≈ 1/6 (论文推荐值)
 
         最终结果: 边界点固定为条件值，中间点为距离缩放的噪声
         """
@@ -339,9 +341,9 @@ class AlphaDDIM(nn.Module):
         # 有效轨迹长度
         m = effective_length if effective_length else self.seq_length
 
-        # 论文 Eq.3: σ_ε = k_σ · ||d|| / √(m-1)
-        # k_σ = 0.5 是经验值，使噪声幅度适中
-        k_sigma = 0.5
+        # 论文 Eq.3: σ_ε = k_c · ||d|| / √(m-1)
+        # k_c ≈ 1/6 是论文推荐值
+        k_sigma = 1.0 / 6.0
         sigma_epsilon = k_sigma * distance / (np.sqrt(m - 1) + 1e-8)  # (batch, 1)
         sigma_epsilon = sigma_epsilon.unsqueeze(1)  # (batch, 1, 1) for broadcasting
 
@@ -777,9 +779,12 @@ class EntropyController:
         else:
             # 使用简化的路径比率
             mst_ratio = self.compute_mst_ratio(trajectory)
+            # 论文 Eq.8-9: β/(β+1) 公式
             # ratio=1 (直线) -> complexity=0
-            # ratio=3 (复杂曲线) -> complexity=1
-            complexity = torch.clamp((mst_ratio - 1.0) / 2.0, 0.0, 1.0)
+            # ratio→∞ -> complexity→1
+            beta = mst_ratio - 1.0
+            complexity = beta / (beta + 1.0 + 1e-8)
+            complexity = torch.clamp(complexity, 0.0, 1.0)
 
         return complexity
 
