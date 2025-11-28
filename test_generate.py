@@ -5,11 +5,109 @@ DMTG 轨迹生成测试脚本
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from pathlib import Path
 import argparse
 from datetime import datetime
+import platform
+import tkinter as tk
+from tkinter import ttk
 
 from src.models.alpha_ddim import create_alpha_ddim, EntropyController
+
+# 设置中文字体
+def setup_chinese_font():
+    """配置 matplotlib 支持中文"""
+    system = platform.system()
+    if system == 'Windows':
+        # Windows 系统使用微软雅黑
+        plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
+    elif system == 'Darwin':
+        # macOS 使用苹方
+        plt.rcParams['font.sans-serif'] = ['PingFang SC', 'Heiti SC', 'DejaVu Sans']
+    else:
+        # Linux 使用文泉驿
+        plt.rcParams['font.sans-serif'] = ['WenQuanYi Micro Hei', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+
+setup_chinese_font()
+
+
+def show_figure_with_scroll(fig, title="DMTG 轨迹生成结果"):
+    """
+    在带滚动条的窗口中显示 matplotlib 图表
+    """
+    # 创建主窗口
+    root = tk.Tk()
+    root.title(title)
+
+    # 获取屏幕尺寸
+    screen_width = root.winfo_screenwidth()
+    screen_height = root.winfo_screenheight()
+
+    # 设置窗口大小（屏幕的80%）
+    window_width = int(screen_width * 0.85)
+    window_height = int(screen_height * 0.85)
+
+    # 居中显示
+    x = (screen_width - window_width) // 2
+    y = (screen_height - window_height) // 2
+    root.geometry(f"{window_width}x{window_height}+{x}+{y}")
+
+    # 创建主框架
+    main_frame = ttk.Frame(root)
+    main_frame.pack(fill=tk.BOTH, expand=True)
+
+    # 创建画布和滚动条
+    canvas = tk.Canvas(main_frame)
+    v_scrollbar = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=canvas.yview)
+    h_scrollbar = ttk.Scrollbar(main_frame, orient=tk.HORIZONTAL, command=canvas.xview)
+
+    # 配置画布
+    canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+
+    # 布局
+    v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    # 创建内部框架
+    inner_frame = ttk.Frame(canvas)
+    canvas.create_window((0, 0), window=inner_frame, anchor=tk.NW)
+
+    # 将 matplotlib 图表嵌入 tkinter
+    fig_canvas = FigureCanvasTkAgg(fig, master=inner_frame)
+    fig_canvas.draw()
+    fig_canvas.get_tk_widget().pack()
+
+    # 更新滚动区域
+    def update_scroll_region(event=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    inner_frame.bind("<Configure>", update_scroll_region)
+
+    # 鼠标滚轮支持
+    def on_mousewheel(event):
+        # Windows
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def on_shift_mousewheel(event):
+        # 水平滚动
+        canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    canvas.bind_all("<MouseWheel>", on_mousewheel)
+    canvas.bind_all("<Shift-MouseWheel>", on_shift_mousewheel)
+
+    # 关闭窗口时的处理
+    def on_closing():
+        plt.close(fig)
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+
+    # 运行主循环
+    root.mainloop()
 
 
 def load_model(checkpoint_path: str, device: str = "cuda"):
@@ -246,6 +344,88 @@ def plot_metrics_comparison(results: list, save_path: str = None):
     plt.show()
 
 
+def plot_combined_results(results: list, save_path: str = None, effective_length: int = None):
+    """
+    绘制综合结果图：轨迹 + 指标，合并为一张大图
+    """
+    alphas = sorted(set(r['alpha'] for r in results))
+    n_alphas = len(alphas)
+
+    # 创建大图: 上面是轨迹，下面是指标
+    fig = plt.figure(figsize=(5 * n_alphas, 10))
+
+    # 上半部分：按 alpha 分组的轨迹
+    for i, alpha in enumerate(alphas):
+        ax = fig.add_subplot(2, n_alphas, i + 1)
+        alpha_results = [r for r in results if r['alpha'] == alpha]
+
+        for r in alpha_results:
+            traj = r['trajectory']
+            ax.plot(traj[:, 0], traj[:, 1], linewidth=1.5, alpha=0.7)
+            ax.scatter(traj[0, 0], traj[0, 1], c='green', s=80, zorder=5)
+            ax.scatter(traj[-1, 0], traj[-1, 1], c='red', s=80, zorder=5)
+
+        # 计算平均指标
+        avg_ratio = np.mean([r['metrics']['path_ratio'] for r in alpha_results])
+        avg_curv = np.mean([r['metrics']['curvature'] for r in alpha_results])
+
+        m_str = f", m={effective_length}" if effective_length else ""
+        ax.set_title(f'α={alpha}{m_str}\n路径比={avg_ratio:.2f}, 曲率={avg_curv:.3f}')
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+
+    # 下半部分：指标对比 (3个子图)
+    metrics_by_alpha = {}
+    for alpha in alphas:
+        alpha_results = [r for r in results if r['alpha'] == alpha]
+        metrics_by_alpha[alpha] = {
+            'path_ratio': [r['metrics']['path_ratio'] for r in alpha_results],
+            'curvature': [r['metrics']['curvature'] for r in alpha_results],
+            'speed_std': [r['metrics']['speed_std'] for r in alpha_results],
+        }
+
+    # 路径比率
+    ax = fig.add_subplot(2, 3, 4)
+    data = [metrics_by_alpha[a]['path_ratio'] for a in alphas]
+    ax.boxplot(data, labels=[f'{a}' for a in alphas])
+    ax.set_xlabel('Alpha')
+    ax.set_ylabel('路径比率')
+    ax.set_title('路径比率 vs Alpha')
+    ax.grid(True, alpha=0.3)
+
+    # 曲率
+    ax = fig.add_subplot(2, 3, 5)
+    data = [metrics_by_alpha[a]['curvature'] for a in alphas]
+    ax.boxplot(data, labels=[f'{a}' for a in alphas])
+    ax.set_xlabel('Alpha')
+    ax.set_ylabel('曲率 (rad)')
+    ax.set_title('曲率 vs Alpha')
+    ax.grid(True, alpha=0.3)
+
+    # 速度变化
+    ax = fig.add_subplot(2, 3, 6)
+    data = [metrics_by_alpha[a]['speed_std'] for a in alphas]
+    ax.boxplot(data, labels=[f'{a}' for a in alphas])
+    ax.set_xlabel('Alpha')
+    ax.set_ylabel('速度标准差')
+    ax.set_title('速度变化 vs Alpha')
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"已保存: {save_path}")
+
+    # 使用带滚动条的窗口显示
+    m_str = f" (m={effective_length})" if effective_length else ""
+    show_figure_with_scroll(fig, title=f"DMTG 轨迹生成结果{m_str}")
+
+
 def print_metrics_table(results: list):
     """打印指标表格"""
     print("\n" + "=" * 70)
@@ -278,6 +458,8 @@ def main():
                        help="Number of samples per configuration")
     parser.add_argument("--output_dir", type=str, default="outputs",
                        help="Output directory for plots")
+    parser.add_argument("--effective_length", "-m", type=int, default=None,
+                       help="Effective trajectory length (node count m)")
     args = parser.parse_args()
 
     # 创建输出目录
@@ -312,6 +494,7 @@ def main():
     print(f"  - {len(test_pairs)} start-end pairs")
     print(f"  - {len(alphas)} alpha values: {alphas}")
     print(f"  - {args.num_samples} samples each")
+    print(f"  - effective_length (m): {args.effective_length or 500}")
 
     all_results = []
 
@@ -330,17 +513,24 @@ def main():
                         alpha=alpha,
                         num_inference_steps=50,
                         device=args.device,
+                        effective_length=args.effective_length,
                     )
 
                 traj_np = traj[0].cpu().numpy()
-                metrics = compute_trajectory_metrics(traj_np)
+
+                # 如果指定了 effective_length，只取有效部分
+                m = args.effective_length or len(traj_np)
+                traj_valid = traj_np[:m]
+
+                metrics = compute_trajectory_metrics(traj_valid)
 
                 all_results.append({
                     'start': start,
                     'end': end,
                     'alpha': alpha,
-                    'trajectory': traj_np,
+                    'trajectory': traj_valid,  # 只存有效部分
                     'metrics': metrics,
+                    'effective_length': m,
                 })
 
     print(f"Generated {len(all_results)} trajectories")
@@ -352,31 +542,17 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # 绘制图表
-    print("\nGenerating plots...")
+    print("\n正在生成图表...")
 
-    # 1. 按 alpha 分组的轨迹图
-    plot_trajectories_by_alpha(
+    # 综合图：轨迹 + 指标合并显示
+    plot_combined_results(
         all_results,
-        save_path=output_dir / f"trajectories_by_alpha_{timestamp}.png"
+        save_path=output_dir / f"combined_results_{timestamp}.png",
+        effective_length=args.effective_length
     )
 
-    # 2. 指标对比图
-    plot_metrics_comparison(
-        all_results,
-        save_path=output_dir / f"metrics_comparison_{timestamp}.png"
-    )
-
-    # 3. 单个起点-终点对的详细图
-    single_pair_results = [r for r in all_results
-                          if r['start'] == (0.1, 0.1) and r['end'] == (0.9, 0.9)]
-    if single_pair_results:
-        plot_trajectories_by_alpha(
-            single_pair_results,
-            save_path=output_dir / f"diagonal_trajectories_{timestamp}.png"
-        )
-
-    print(f"\nAll plots saved to {output_dir}/")
-    print("Done!")
+    print(f"\n图表已保存到 {output_dir}/")
+    print("完成!")
 
 
 if __name__ == "__main__":
