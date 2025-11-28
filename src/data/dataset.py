@@ -431,19 +431,19 @@ class MouseTrajectoryDataset(Dataset):
         start_point = coords[0]
         end_point = coords[-1]
 
+        # 时间戳（始终包含以保持batch一致性）
+        padded_t = np.zeros(self.max_length, dtype=np.float32)
+        if timestamps is not None:
+            padded_t[:length] = timestamps[:length]
+
         result = {
             'trajectory': torch.FloatTensor(padded_traj),
             'mask': torch.FloatTensor(mask),
             'start_point': torch.FloatTensor(start_point),
             'end_point': torch.FloatTensor(end_point),
             'length': torch.LongTensor([length]),
+            'timestamps': torch.FloatTensor(padded_t),
         }
-
-        # 添加时间戳（如果有）
-        if timestamps is not None:
-            padded_t = np.zeros(self.max_length, dtype=np.float32)
-            padded_t[:length] = timestamps[:length]
-            result['timestamps'] = torch.FloatTensor(padded_t)
 
         return result
 
@@ -601,19 +601,19 @@ class CombinedMouseDataset(Dataset):
             start_point = coords[0]
             end_point = coords[-1]
 
+            # 时间戳（始终包含以保持batch一致性）
+            padded_t = np.zeros(self.max_length, dtype=np.float32)
+            if timestamps is not None:
+                padded_t[:length] = timestamps[:length]
+
             result = {
                 'trajectory': torch.FloatTensor(padded_traj),
                 'mask': torch.FloatTensor(mask),
                 'start_point': torch.FloatTensor(start_point),
                 'end_point': torch.FloatTensor(end_point),
                 'length': torch.LongTensor([length]),
+                'timestamps': torch.FloatTensor(padded_t),
             }
-
-            # 添加时间戳（如果有）
-            if timestamps is not None:
-                padded_t = np.zeros(self.max_length, dtype=np.float32)
-                padded_t[:length] = timestamps[:length]
-                result['timestamps'] = torch.FloatTensor(padded_t)
 
             return result
 
