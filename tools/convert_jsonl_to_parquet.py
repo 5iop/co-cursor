@@ -41,6 +41,10 @@ def extract_trajectories(jsonl_file: Path, min_length: int = 10):
                     t_list.append(float(point.get('t', 0.0)))
 
             if len(x_list) >= min_length:
+                # 时间戳归一化：每个片段从 0 开始
+                t_start = t_list[0]
+                t_list = [t - t_start for t in t_list]
+
                 x_data.append(x_list)
                 y_data.append(y_list)
                 t_data.append(t_list)
@@ -135,7 +139,7 @@ def main():
 
     args = parser.parse_args()
 
-    base_dir = Path(__file__).parent
+    base_dir = Path(__file__).parent.parent  # 项目根目录
     input_dir = base_dir / args.input_dir
 
     if args.merge:

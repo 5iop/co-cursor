@@ -50,7 +50,7 @@ extract_datasets() {
     # 解压 SapiMouse
     if [ -f "downloads/sapimouse.zip" ]; then
         echo "解压 SapiMouse..."
-        unzip -o downloads/sapimouse.zip -d datasets/
+        7z x -y downloads/sapimouse.zip -odatasets/
     fi
 
     # 移动 BOUN Parquet 文件

@@ -188,7 +188,7 @@ class MouseTrajectoryDataset(Dataset):
             # Eager模式：加载全部数据到内存
             print(f"Loading Open Images Parquet ({len(parquet_files)} files)...")
 
-            for parquet_file in tqdm(parquet_files, desc="Loading Parquet files"):
+            for parquet_file in parquet_files:
                 try:
                     table = pq.read_table(parquet_file)
                 except Exception as e:
@@ -199,7 +199,8 @@ class MouseTrajectoryDataset(Dataset):
                 y_col = table.column('y')
                 t_col = table.column('t') if 't' in table.column_names else None
 
-                for i in range(len(table)):
+                # 每个文件单独的进度条
+                for i in tqdm(range(len(table)), desc=f"  {parquet_file.name}", leave=False):
                     x_list = x_col[i].as_py()
                     y_list = y_col[i].as_py()
 
@@ -217,6 +218,8 @@ class MouseTrajectoryDataset(Dataset):
                             timestamps = timestamps[:self.max_length]
 
                     self.trajectories.append((coords, len(coords), timestamps))
+
+                print(f"  {parquet_file.name}: {len(table)} records loaded")
 
     def _load_jsonl(self):
         """加载JSONL格式数据集"""

@@ -341,12 +341,17 @@ def main():
 
     args = parser.parse_args()
 
+    # 项目根目录
+    base_dir = Path(__file__).parent.parent
+    input_dir = base_dir / args.input_dir
+    output_dir = base_dir / args.output_dir
+
     if args.analyze:
-        analyze_dataset(args.input_dir)
+        analyze_dataset(str(input_dir))
     else:
         preprocess_boun(
-            input_dir=args.input_dir,
-            output_dir=args.output_dir,
+            input_dir=str(input_dir),
+            output_dir=str(output_dir),
             min_steps=args.min_steps,
             clean_output=not args.no_clean,
         )

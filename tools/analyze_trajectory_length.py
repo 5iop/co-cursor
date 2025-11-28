@@ -144,11 +144,14 @@ def main():
 
     args = parser.parse_args()
 
+    # 项目根目录
+    base_dir = Path(__file__).parent.parent
+
     all_counts = []
     datasets_analyzed = []
 
     # 分析BOUN数据集
-    boun_path = Path(args.boun)
+    boun_path = base_dir / args.boun
     if boun_path.exists():
         counts = analyze_dataset(boun_path, "BOUN (处理后)", args.threads)
         if counts:
@@ -159,7 +162,7 @@ def main():
         print(f"BOUN目录不存在: {boun_path}")
 
     # 分析Open Images数据集
-    open_images_path = Path(args.open_images)
+    open_images_path = base_dir / args.open_images
     if open_images_path.exists():
         counts = analyze_dataset(open_images_path, "Open Images V6", args.threads)
         if counts:
@@ -171,7 +174,7 @@ def main():
 
     # 分析自定义数据集
     if args.custom:
-        custom_path = Path(args.custom)
+        custom_path = base_dir / args.custom
         if custom_path.exists():
             counts = analyze_dataset(custom_path, f"自定义 ({custom_path.name})", args.threads)
             if counts:
