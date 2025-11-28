@@ -98,10 +98,11 @@ class Trainer:
         device: str = "cuda",
         checkpoint_dir: str = "checkpoints",
         log_dir: str = "logs",
-        # 损失权重 (论文 Eq.14)
+        # 损失权重 (论文 Eq.14 + 长度预测)
         lambda_ddim: float = 1.0,
         lambda_sim: float = 0.1,
         lambda_style: float = 0.05,
+        lambda_length: float = 0.1,  # 长度预测损失权重
     ):
         self.device = device
         self.model = model.to(device)
@@ -145,11 +146,12 @@ class Trainer:
             eta_min=1e-6,
         )
 
-        # 损失函数 (论文 Eq.14: L = w1·LDDIM + w2·Lsim + w3·Lstyle)
+        # 损失函数 (论文 Eq.14 + 长度预测: L = w1·LDDIM + w2·Lsim + w3·Lstyle + w4·Llength)
         self.loss_fn = DMTGLoss(
             lambda_ddim=lambda_ddim,
             lambda_sim=lambda_sim,
             lambda_style=lambda_style,
+            lambda_length=lambda_length,
         )
 
         # 训练状态
@@ -170,13 +172,14 @@ class Trainer:
 
         # 只在主进程显示进度条
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}", disable=not is_main_process())
-        loss_components = {'ddim': 0, 'sim': 0, 'style': 0, 'boundary': 0}
+        loss_components = {'ddim': 0, 'sim': 0, 'style': 0, 'boundary': 0, 'length': 0}
 
         for batch in pbar:
             trajectory = batch['trajectory'].to(self.device)
             mask = batch['mask'].to(self.device)  # 有效位置掩码
             start_point = batch['start_point'].to(self.device)
             end_point = batch['end_point'].to(self.device)
+            length = batch['length'].to(self.device)  # 轨迹真实长度 (batch, 1)
 
             # 构建条件
             condition = torch.cat([start_point, end_point], dim=1)
@@ -203,8 +206,14 @@ class Trainer:
             # 计算预测的x0（用于辅助损失）
             predicted_x0 = self.model_raw.predict_x0_from_noise(x_t, t, predicted_noise)
 
-            # 使用DMTGLoss计算完整损失 (论文公式14)
-            # L = w1·LDDIM + w2·Lsim + w3·Lstyle
+            # 长度预测 (如果模型支持)
+            predicted_log_length = None
+            unet = self.model_raw.model.module if self.distributed else self.model_raw.model
+            if hasattr(unet, 'length_head') and unet.length_head is not None:
+                predicted_log_length = unet.predict_length(condition, alpha)
+
+            # 使用DMTGLoss计算完整损失 (论文公式14 + 长度预测)
+            # L = w1·LDDIM + w2·Lsim + w3·Lstyle + w4·Llength
             loss_dict = self.loss_fn(
                 predicted_noise=predicted_noise,
                 target_noise=noise,
@@ -214,6 +223,8 @@ class Trainer:
                 t=t,
                 timesteps=self.model_raw.timesteps,
                 mask=mask,             # 有效位置掩码
+                predicted_log_length=predicted_log_length,  # 预测的 log(m+1)
+                target_length=length.squeeze(-1),  # 目标长度 m
             )
             loss = loss_dict['total_loss']
 
@@ -234,13 +245,18 @@ class Trainer:
                 loss_components['style'] += loss_dict['style_loss'].item()
             if 'boundary_loss' in loss_dict:
                 loss_components['boundary'] += loss_dict['boundary_loss'].item()
+            if 'length_loss' in loss_dict:
+                loss_components['length'] += loss_dict['length_loss'].item()
             num_batches += 1
             self.global_step += 1
 
-            pbar.set_postfix({
+            postfix = {
                 'loss': f"{loss.item():.4f}",
                 'ddim': f"{loss_dict['ddim_loss'].item():.4f}",
-            })
+            }
+            if 'length_loss' in loss_dict:
+                postfix['len'] = f"{loss_dict['length_loss'].item():.4f}"
+            pbar.set_postfix(postfix)
 
         avg_loss = total_loss / num_batches
         self.train_losses.append(avg_loss)
@@ -261,6 +277,7 @@ class Trainer:
             mask = batch['mask'].to(self.device)  # 有效位置掩码
             start_point = batch['start_point'].to(self.device)
             end_point = batch['end_point'].to(self.device)
+            length = batch['length'].to(self.device)  # 轨迹真实长度 (batch, 1)
 
             condition = torch.cat([start_point, end_point], dim=1)
             batch_size = trajectory.shape[0]
@@ -278,7 +295,13 @@ class Trainer:
             # 计算预测的x0
             predicted_x0 = self.model_raw.predict_x0_from_noise(x_t, t, predicted_noise)
 
-            # 使用DMTGLoss计算完整损失 (论文公式14)
+            # 长度预测 (如果模型支持)
+            predicted_log_length = None
+            unet = self.model_raw.model.module if self.distributed else self.model_raw.model
+            if hasattr(unet, 'length_head') and unet.length_head is not None:
+                predicted_log_length = unet.predict_length(condition, alpha)
+
+            # 使用DMTGLoss计算完整损失 (论文公式14 + 长度预测)
             loss_dict = self.loss_fn(
                 predicted_noise=predicted_noise,
                 target_noise=noise,
@@ -288,6 +311,8 @@ class Trainer:
                 t=t,
                 timesteps=self.model_raw.timesteps,
                 mask=mask,             # 有效位置掩码
+                predicted_log_length=predicted_log_length,  # 预测的 log(m+1)
+                target_length=length.squeeze(-1),  # 目标长度 m
             )
             total_loss += loss_dict['total_loss'].item()
             num_batches += 1
@@ -565,7 +590,7 @@ def parse_args():
         help="从检查点恢复训练"
     )
 
-    # 损失权重 (论文 Eq.14)
+    # 损失权重 (论文 Eq.14 + 长度预测)
     parser.add_argument(
         "--lambda_ddim",
         type=float,
@@ -583,6 +608,12 @@ def parse_args():
         type=float,
         default=0.05,
         help="风格损失权重 (w3)"
+    )
+    parser.add_argument(
+        "--lambda_length",
+        type=float,
+        default=0.1,
+        help="长度预测损失权重 (w4)"
     )
 
     return parser.parse_args()
@@ -722,10 +753,11 @@ def main():
         num_epochs=args.num_epochs,  # 传入总轮数以正确设置 LR scheduler
         device=device,  # 使用 DDP 设置的设备
         checkpoint_dir=args.checkpoint_dir,
-        # 损失权重 (论文 Eq.14)
+        # 损失权重 (论文 Eq.14 + 长度预测)
         lambda_ddim=args.lambda_ddim,
         lambda_sim=args.lambda_sim,
         lambda_style=args.lambda_style,
+        lambda_length=args.lambda_length,
     )
 
     # 恢复训练

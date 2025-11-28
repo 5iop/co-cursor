@@ -1,28 +1,30 @@
 """
 DMTG损失函数模块 (论文公式11-14)
 
-L = w1·LDDIM + w2·Lsim + w3·Lstyle
+L = w1·LDDIM + w2·Lsim + w3·Lstyle + w4·Llength
 
 - LDDIM (Eq.11): 噪声预测MSE
 - Lsim  (Eq.12): 生成轨迹与人类模板的MSE
 - Lstyle(Eq.13): 生成轨迹复杂度与目标α的差距
+- Llength: 轨迹长度预测L1损失 (新增)
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict
+from typing import Dict, Optional
 
 
 class DMTGLoss(nn.Module):
     """
-    DMTG完整损失函数 (论文公式14)
+    DMTG完整损失函数 (论文公式14 扩展)
 
-    L = w1·LDDIM + w2·Lsim + w3·Lstyle
+    L = w1·LDDIM + w2·Lsim + w3·Lstyle + w4·Llength
 
     其中 (严格按照论文):
     - LDDIM: 噪声预测MSE (公式11)
     - Lsim: 生成轨迹与人类模板的MSE (公式12) - ||p_a - X̂||²
     - Lstyle: 生成轨迹复杂度与目标α的差距 (公式13) - ||α - ratio(p_a)||²
+    - Llength: 轨迹长度预测L1损失 (新增) - |log(m+1) - log(m̂+1)|
     """
 
     def __init__(
@@ -30,11 +32,13 @@ class DMTGLoss(nn.Module):
         lambda_ddim: float = 1.0,     # w1: DDIM损失权重
         lambda_sim: float = 0.1,      # w2: 相似度损失权重
         lambda_style: float = 0.05,   # w3: 风格损失权重
+        lambda_length: float = 0.1,   # w4: 长度预测损失权重
     ):
         super().__init__()
         self.lambda_ddim = lambda_ddim
         self.lambda_sim = lambda_sim
         self.lambda_style = lambda_style
+        self.lambda_length = lambda_length
 
     def forward(
         self,
@@ -46,10 +50,12 @@ class DMTGLoss(nn.Module):
         t: torch.Tensor = None,
         timesteps: int = 1000,
         mask: torch.Tensor = None,        # 有效位置掩码 (batch, seq_len)
+        predicted_log_length: torch.Tensor = None,  # 预测的 log(m+1)
+        target_length: torch.Tensor = None,         # 目标长度 m
     ) -> Dict[str, torch.Tensor]:
         """
-        计算DMTG总损失 (论文公式14)
-        L = w1·LDDIM + w2·Lsim + w3·Lstyle
+        计算DMTG总损失 (论文公式14 扩展)
+        L = w1·LDDIM + w2·Lsim + w3·Lstyle + w4·Llength
 
         Args:
             predicted_noise: 预测的噪声 (batch, seq_len, 2)
@@ -60,6 +66,8 @@ class DMTGLoss(nn.Module):
             t: 时间步
             timesteps: 总时间步数
             mask: 有效位置掩码 (batch, seq_len)，1表示有效，0表示padding
+            predicted_log_length: 预测的 log(m+1) (batch, 1)
+            target_length: 目标长度 m (batch,) 或 (batch, 1)
         """
         losses = {}
 
@@ -81,6 +89,12 @@ class DMTGLoss(nn.Module):
                 style_loss = self._style_loss(predicted_x0, alpha, mask)
                 losses['style_loss'] = style_loss
                 total_loss = total_loss + self.lambda_style * style_loss
+
+        # 3. Llength: 长度预测L1损失 (新增)
+        if predicted_log_length is not None and target_length is not None:
+            length_loss = self._length_loss(predicted_log_length, target_length)
+            losses['length_loss'] = length_loss
+            total_loss = total_loss + self.lambda_length * length_loss
 
         losses['total_loss'] = total_loss
         return losses
@@ -182,10 +196,42 @@ class DMTGLoss(nn.Module):
 
         return style_loss
 
+    def _length_loss(
+        self,
+        predicted_log_length: torch.Tensor,
+        target_length: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        轨迹长度预测L1损失
+
+        使用 log-transform 来处理长度预测:
+        y = log(m + 1)
+
+        L1 损失: |log(m+1) - log(m̂+1)|
+
+        Args:
+            predicted_log_length: 预测的 log(m+1) (batch, 1)
+            target_length: 目标长度 m (batch,) 或 (batch, 1)
+
+        Returns:
+            L1 损失标量
+        """
+        # 确保 target_length 是正确的形状
+        if target_length.dim() == 1:
+            target_length = target_length.unsqueeze(-1)  # (batch,) -> (batch, 1)
+
+        # 计算目标的 log-transform: y = log(m + 1)
+        target_log_length = torch.log(target_length.float() + 1)
+
+        # L1 损失
+        length_loss = F.l1_loss(predicted_log_length, target_log_length)
+
+        return length_loss
+
 
 if __name__ == "__main__":
-    # 测试损失函数 (论文公式11-14)
-    print("Testing DMTG Loss (Paper Eq. 11-14)")
+    # 测试损失函数 (论文公式11-14 + 长度预测)
+    print("Testing DMTG Loss (Paper Eq. 11-14 + Length Prediction)")
     print("=" * 50)
 
     batch_size = 4
@@ -197,11 +243,16 @@ if __name__ == "__main__":
     target_x0 = torch.randn(batch_size, seq_len, 2)  # human template
     alpha = torch.rand(batch_size)  # target complexity
 
-    # Test paper Eq.14: L = w1*LDDIM + w2*Lsim + w3*Lstyle
+    # 长度预测测试数据
+    target_length = torch.randint(10, 500, (batch_size,))  # 真实长度
+    predicted_log_length = torch.log(target_length.float() + 1) + torch.randn(batch_size, 1) * 0.5  # 有噪声的预测
+
+    # Test paper Eq.14: L = w1*LDDIM + w2*Lsim + w3*Lstyle + w4*Llength
     loss_fn = DMTGLoss(
         lambda_ddim=1.0,   # w1
         lambda_sim=0.1,    # w2
         lambda_style=0.05, # w3
+        lambda_length=0.1, # w4
     )
     losses = loss_fn(
         predicted_noise=predicted_noise,
@@ -209,6 +260,8 @@ if __name__ == "__main__":
         predicted_x0=predicted_x0,
         target_x0=target_x0,
         alpha=alpha,
+        predicted_log_length=predicted_log_length,
+        target_length=target_length,
     )
 
     print("Loss components:")
@@ -226,3 +279,13 @@ if __name__ == "__main__":
 
     print(f"\nPredicted path ratios: {[f'{r:.3f}' for r in pred_ratio.tolist()]}")
     print(f"Target ratios (from alpha): {[f'{r:.3f}' for r in target_ratio.tolist()]}")
+
+    # 验证长度预测
+    print(f"\n--- Length Prediction ---")
+    print(f"Target lengths: {target_length.tolist()}")
+    print(f"Target log(m+1): {[f'{v:.3f}' for v in torch.log(target_length.float() + 1).tolist()]}")
+    print(f"Predicted log(m+1): {[f'{v:.3f}' for v in predicted_log_length.squeeze().tolist()]}")
+
+    # 反变换
+    decoded_length = torch.round(torch.exp(predicted_log_length.squeeze()) - 1).long()
+    print(f"Decoded predicted lengths: {decoded_length.tolist()}")

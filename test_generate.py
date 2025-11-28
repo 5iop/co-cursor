@@ -494,7 +494,10 @@ def main():
     print(f"  - {len(test_pairs)} start-end pairs")
     print(f"  - {len(alphas)} alpha values: {alphas}")
     print(f"  - {args.num_samples} samples each")
-    print(f"  - effective_length (m): {args.effective_length or 500}")
+    if args.effective_length is not None:
+        print(f"  - effective_length (m): {args.effective_length}")
+    else:
+        print(f"  - effective_length (m): 自动预测 (auto_length)")
 
     all_results = []
 
@@ -507,19 +510,32 @@ def main():
                 )
 
                 with torch.no_grad():
-                    traj = model.sample(
-                        batch_size=1,
-                        condition=condition,
-                        alpha=alpha,
-                        num_inference_steps=50,
-                        device=args.device,
-                        effective_length=args.effective_length,
-                    )
+                    if args.effective_length is not None:
+                        # 用户指定了 -m 参数，使用指定长度
+                        traj = model.sample(
+                            batch_size=1,
+                            condition=condition,
+                            alpha=alpha,
+                            num_inference_steps=50,
+                            device=args.device,
+                            effective_length=args.effective_length,
+                        )
+                        m = args.effective_length
+                    else:
+                        # 未指定 -m，使用自动长度预测
+                        traj, pred_lengths = model.sample_with_auto_length(
+                            batch_size=1,
+                            condition=condition,
+                            alpha=alpha,
+                            num_inference_steps=50,
+                            device=args.device,
+                        )
+                        m = pred_lengths[0].item()
 
                 traj_np = traj[0].cpu().numpy()
 
-                # 如果指定了 effective_length，只取有效部分
-                m = args.effective_length or len(traj_np)
+                # 只取有效部分
+                m = int(m)  # 确保是整数
                 traj_valid = traj_np[:m]
 
                 metrics = compute_trajectory_metrics(traj_valid)
@@ -531,6 +547,7 @@ def main():
                     'trajectory': traj_valid,  # 只存有效部分
                     'metrics': metrics,
                     'effective_length': m,
+                    'auto_length': args.effective_length is None,  # 是否使用自动长度
                 })
 
     print(f"Generated {len(all_results)} trajectories")
@@ -545,10 +562,12 @@ def main():
     print("\n正在生成图表...")
 
     # 综合图：轨迹 + 指标合并显示
+    # 如果使用自动长度，传入 "auto"；否则传入指定的长度
+    eff_len_display = "auto" if args.effective_length is None else args.effective_length
     plot_combined_results(
         all_results,
         save_path=output_dir / f"combined_results_{timestamp}.png",
-        effective_length=args.effective_length
+        effective_length=eff_len_display
     )
 
     print(f"\n图表已保存到 {output_dir}/")

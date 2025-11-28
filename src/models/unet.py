@@ -70,6 +70,46 @@ class DiscreteAlphaEmbedding(nn.Module):
         return self.proj(emb)
 
 
+class LengthPredictionHead(nn.Module):
+    """
+    轨迹长度预测头
+
+    基于条件编码（起点、终点）和α（复杂度）预测轨迹长度的对数值
+    y = log(m + 1)
+
+    输入: 条件编码 + α编码
+    输出: log(m + 1) 预测值
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 256,  # condition_dim + alpha_dim (通常是 time_emb_dim * 2)
+        hidden_dim: int = 128,
+        output_dim: int = 1,
+    ):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, condition_emb: torch.Tensor, alpha_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            condition_emb: 条件编码 (batch, emb_dim)
+            alpha_emb: α编码 (batch, emb_dim)
+
+        Returns:
+            log_length: log(m+1) 预测值 (batch, 1)
+        """
+        # 拼接条件和α编码
+        combined = torch.cat([condition_emb, alpha_emb], dim=-1)
+        return self.mlp(combined)
+
+
 class ConvBlock(nn.Module):
     """卷积块，包含两个卷积层和GroupNorm"""
 
@@ -225,6 +265,9 @@ class TrajectoryUNet(nn.Module):
     输出: (batch, seq_len, 2) - 预测噪声
 
     论文公式10: ε_θ(x_t, t, c, α)
+
+    新增功能: 轨迹长度预测
+    基于条件和α预测轨迹长度 m，用于自适应长度生成
     """
 
     def __init__(
@@ -237,11 +280,14 @@ class TrajectoryUNet(nn.Module):
         condition_dim: int = 4,  # 起点(2) + 终点(2)
         num_heads: int = 4,
         attention_levels: tuple = (False, True, True),
+        enable_length_prediction: bool = True,  # 是否启用长度预测
     ):
         super().__init__()
         self.seq_length = seq_length
         self.input_dim = input_dim
         self.base_channels = base_channels
+        self.time_emb_dim = time_emb_dim
+        self.enable_length_prediction = enable_length_prediction
 
         # 时间嵌入
         self.time_mlp = nn.Sequential(
@@ -264,6 +310,18 @@ class TrajectoryUNet(nn.Module):
             num_bins=10,  # S=10 个风格bin
             embedding_dim=time_emb_dim
         )
+
+        # 轨迹长度预测头
+        # 输入: condition_emb (time_emb_dim) + alpha_emb (time_emb_dim)
+        # 输出: log(m+1) 预测值
+        if enable_length_prediction:
+            self.length_head = LengthPredictionHead(
+                input_dim=time_emb_dim * 2,  # condition + alpha
+                hidden_dim=time_emb_dim,
+                output_dim=1,
+            )
+        else:
+            self.length_head = None
 
         # 输入投影
         self.input_proj = nn.Conv1d(input_dim, base_channels, 3, padding=1)
@@ -367,10 +425,68 @@ class TrajectoryUNet(nn.Module):
         # 转换回 (batch, seq_len, 2)
         return h.transpose(1, 2)
 
+    def predict_length(
+        self,
+        condition: torch.Tensor,  # (batch, 4) - 起点+终点
+        alpha: torch.Tensor,      # (batch,) 或 (batch, 1) - 复杂度参数
+    ) -> torch.Tensor:
+        """
+        预测轨迹长度
+
+        基于条件（起点、终点）和α（复杂度）预测轨迹长度的对数值
+        y = log(m + 1)
+
+        Args:
+            condition: 起点+终点条件 (batch, 4)
+            alpha: 复杂度/风格参数 (batch,) 或 (batch, 1)
+
+        Returns:
+            log_length: log(m+1) 预测值 (batch, 1)
+        """
+        if self.length_head is None:
+            raise RuntimeError("Length prediction is not enabled. Set enable_length_prediction=True.")
+
+        # 获取条件编码
+        cond_emb = self.condition_mlp(condition)  # (batch, time_emb_dim)
+
+        # 获取α编码
+        alpha_emb = self.alpha_embedding(alpha)  # (batch, time_emb_dim)
+
+        # 通过长度预测头
+        log_length = self.length_head(cond_emb, alpha_emb)  # (batch, 1)
+
+        return log_length
+
+    def decode_length(self, log_length: torch.Tensor, max_length: int = None) -> torch.Tensor:
+        """
+        将 log(m+1) 解码为实际长度 m
+
+        m̂ = round(exp(ŷ) - 1)
+
+        Args:
+            log_length: log(m+1) 预测值 (batch, 1)
+            max_length: 最大长度限制 (默认使用 seq_length)
+
+        Returns:
+            length: 预测长度 (batch,) - 整数值
+        """
+        if max_length is None:
+            max_length = self.seq_length
+
+        # 反变换: m = exp(y) - 1
+        length = torch.exp(log_length.squeeze(-1)) - 1
+
+        # 取整并限制范围
+        length = torch.round(length).long()
+        length = torch.clamp(length, min=2, max=max_length)
+
+        return length
+
 
 if __name__ == "__main__":
     # 测试模型
-    model = TrajectoryUNet(seq_length=500, input_dim=2)
+    print("Testing TrajectoryUNet with length prediction...")
+    model = TrajectoryUNet(seq_length=500, input_dim=2, enable_length_prediction=True)
 
     batch_size = 4
     x = torch.randn(batch_size, 500, 2)
@@ -384,3 +500,18 @@ if __name__ == "__main__":
     print(f"Output shape: {output.shape}")
     print(f"Alpha shape: {alpha.shape}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # 测试长度预测
+    print("\nTesting length prediction...")
+    log_length = model.predict_length(cond, alpha)
+    print(f"Predicted log(m+1): {log_length.squeeze().tolist()}")
+
+    # 测试解码
+    decoded_length = model.decode_length(log_length)
+    print(f"Decoded length m: {decoded_length.tolist()}")
+
+    # 测试真实长度的log-transform
+    true_lengths = torch.tensor([50, 100, 200, 500])
+    true_log_lengths = torch.log(true_lengths.float() + 1)
+    print(f"\nTrue lengths: {true_lengths.tolist()}")
+    print(f"True log(m+1): {true_log_lengths.tolist()}")

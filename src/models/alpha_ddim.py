@@ -219,6 +219,7 @@ class AlphaDDIM(nn.Module):
         device: str = "cuda",
         effective_length: int = None,  # 有效轨迹长度 m (论文 Eq.1-3)
         use_entropy_stopping: bool = True,  # 是否使用熵控制早停
+        auto_length: bool = False,  # 是否自动预测轨迹长度
     ) -> torch.Tensor:
         """
         α-DDIM 采样 (论文 Eq.1-9)
@@ -238,6 +239,8 @@ class AlphaDDIM(nn.Module):
             effective_length: 有效轨迹长度 m (默认 None 使用 seq_length)
                              如果 m < seq_length，超出部分将是零填充
             use_entropy_stopping: 是否使用 MST 熵控制早停
+            auto_length: 是否自动预测轨迹长度 (需要模型启用 enable_length_prediction)
+                        如果为 True 且 effective_length 为 None，则自动预测长度
 
         Returns:
             生成的轨迹 (batch, seq_length, 2)
@@ -249,6 +252,23 @@ class AlphaDDIM(nn.Module):
         # α = 0: 简单直线轨迹
         # α = 1: 最复杂曲线轨迹
         alpha_clamped = max(0.0, min(1.0, alpha))
+
+        # 自动长度预测
+        # 如果 auto_length=True 且 effective_length 未指定，则使用模型预测长度
+        predicted_lengths = None
+        if auto_length and effective_length is None:
+            if hasattr(self.model, 'length_head') and self.model.length_head is not None:
+                # 构建 alpha tensor
+                alpha_tensor = torch.full((batch_size,), alpha_clamped, device=device, dtype=torch.float32)
+                # 预测长度
+                log_length = self.model.predict_length(condition, alpha_tensor)
+                predicted_lengths = self.model.decode_length(log_length, max_length=self.seq_length)
+                # 对于批次采样，使用第一个预测长度（或者可以对每个样本使用不同长度）
+                # 这里简化处理：使用批次的平均长度
+                effective_length = int(predicted_lengths.float().mean().item())
+            else:
+                # 模型不支持长度预测，回退到使用全长
+                pass
 
         # 论文 Eq.2-3: 掩码初始化，支持距离缩放噪声和可控长度
         x = self._initialize_with_condition(
@@ -497,6 +517,69 @@ class AlphaDDIM(nn.Module):
 
         return best_trajectories, info
 
+    @torch.no_grad()
+    def sample_with_auto_length(
+        self,
+        batch_size: int,
+        condition: torch.Tensor,
+        alpha: float = 0.5,
+        num_inference_steps: int = 50,
+        eta: float = 0.5,
+        device: str = "cuda",
+        use_entropy_stopping: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        使用自动长度预测生成轨迹
+
+        基于条件和α预测轨迹长度 m，然后生成相应长度的轨迹。
+
+        Args:
+            batch_size: 批次大小
+            condition: 条件张量 (batch, 4) - [start_x, start_y, end_x, end_y]
+            alpha: 目标复杂度 (0-1)
+            num_inference_steps: 推理步数
+            eta: DDIM随机性参数
+            device: 设备
+            use_entropy_stopping: 是否使用熵控制早停
+
+        Returns:
+            (trajectories, predicted_lengths)
+            - trajectories: (batch, seq_length, 2) 生成的轨迹
+            - predicted_lengths: (batch,) 每个样本的预测长度
+        """
+        # 检查模型是否支持长度预测
+        if not hasattr(self.model, 'length_head') or self.model.length_head is None:
+            raise RuntimeError("Model does not support length prediction. Enable enable_length_prediction=True.")
+
+        self.model.eval()
+
+        # 约束 alpha
+        alpha_clamped = max(0.0, min(1.0, alpha))
+
+        # 预测长度
+        alpha_tensor = torch.full((batch_size,), alpha_clamped, device=device, dtype=torch.float32)
+        log_length = self.model.predict_length(condition, alpha_tensor)
+        predicted_lengths = self.model.decode_length(log_length, max_length=self.seq_length)
+
+        # 使用平均长度作为 effective_length (简化处理)
+        # 也可以对每个样本使用不同的长度，但需要更复杂的实现
+        effective_length = int(predicted_lengths.float().mean().item())
+
+        # 生成轨迹
+        trajectories = self.sample(
+            batch_size=batch_size,
+            condition=condition,
+            num_inference_steps=num_inference_steps,
+            alpha=alpha,
+            eta=eta,
+            device=device,
+            effective_length=effective_length,
+            use_entropy_stopping=use_entropy_stopping,
+            auto_length=False,  # 已经手动预测了长度
+        )
+
+        return trajectories, predicted_lengths
+
     def _apply_boundary_conditions(
         self,
         trajectory: torch.Tensor,
@@ -554,6 +637,8 @@ class AlphaDDIM(nn.Module):
         t: torch.Tensor = None,
         alpha: torch.Tensor = None,  # 复杂度参数
         mask: torch.Tensor = None,   # 有效位置掩码
+        length: torch.Tensor = None,  # 轨迹真实长度 m (batch,) 或 (batch, 1)
+        include_length_loss: bool = True,  # 是否计算长度预测损失
     ) -> dict:
         """
         计算训练损失
@@ -564,6 +649,8 @@ class AlphaDDIM(nn.Module):
             t: 时间步 (batch,)
             alpha: 复杂度参数 (batch,) - 从轨迹计算得到
             mask: 有效位置掩码 (batch, seq_len) - 用于正确计算alpha
+            length: 轨迹真实长度 m (batch,) 或 (batch, 1) - 用于长度预测损失
+            include_length_loss: 是否计算长度预测损失 (需要模型启用 enable_length_prediction)
 
         Returns:
             包含各项损失的字典
@@ -589,12 +676,26 @@ class AlphaDDIM(nn.Module):
         # DDIM损失（MSE）
         ddim_loss = F.mse_loss(predicted_noise, noise)
 
-        return {
+        result = {
             'ddim_loss': ddim_loss,
             'predicted_noise': predicted_noise,
             'target_noise': noise,
             'alpha': alpha,
         }
+
+        # 长度预测损失
+        if include_length_loss and length is not None:
+            if hasattr(self.model, 'length_head') and self.model.length_head is not None:
+                # 预测 log(m+1)
+                predicted_log_length = self.model.predict_length(condition, alpha)
+                result['predicted_log_length'] = predicted_log_length
+                result['target_length'] = length
+            else:
+                # 模型不支持长度预测
+                result['predicted_log_length'] = None
+                result['target_length'] = None
+
+        return result
 
     def compute_trajectory_alpha(
         self,
