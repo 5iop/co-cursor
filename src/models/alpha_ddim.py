@@ -285,7 +285,7 @@ class AlphaDDIM(nn.Module):
             )
 
             # 论文 Eq.2: 边界约束 (inpainting)
-            x = self._enforce_boundary_inpainting(x, condition, t, self.timesteps)
+            x = self._enforce_boundary_inpainting(x, condition, t, self.timesteps, effective_length)
 
             # 如果有 effective_length，保持零填充
             if effective_length and effective_length < self.seq_length:
@@ -393,6 +393,7 @@ class AlphaDDIM(nn.Module):
         condition: torch.Tensor,
         t: int,
         total_timesteps: int,
+        effective_length: int = None,
     ) -> torch.Tensor:
         """
         论文 Eq.(2) 风格的边界约束 (Inpainting)
@@ -402,19 +403,26 @@ class AlphaDDIM(nn.Module):
 
         M: 掩码 (边界点=1)
         X_c: 条件值 (起点/终点)
+        effective_length: 有效轨迹长度，终点在 effective_length-1 位置
         """
         start_point = condition[:, :2]  # (batch, 2)
         end_point = condition[:, 2:]    # (batch, 2)
 
+        # 确定终点位置
+        if effective_length and effective_length < self.seq_length:
+            end_idx = effective_length - 1
+        else:
+            end_idx = self.seq_length - 1
+
         # 创建掩码 M
         mask = torch.zeros_like(x)
-        mask[:, 0, :] = 1.0   # 起点
-        mask[:, -1, :] = 1.0  # 终点
+        mask[:, 0, :] = 1.0       # 起点
+        mask[:, end_idx, :] = 1.0  # 终点
 
         # 创建条件值 X_c
         x_c = torch.zeros_like(x)
         x_c[:, 0, :] = start_point
-        x_c[:, -1, :] = end_point
+        x_c[:, end_idx, :] = end_point
 
         # 应用掩码: x' = M ⊙ X_c + (1-M) ⊙ x
         x = mask * x_c + (1 - mask) * x
