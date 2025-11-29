@@ -678,6 +678,7 @@ def create_dataloader(
             shuffle=shuffle,
             num_workers=num_workers,
             pin_memory=True,
+            persistent_workers=num_workers > 0,
         )
 
         val_loader = DataLoader(
@@ -686,6 +687,7 @@ def create_dataloader(
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
+            persistent_workers=num_workers > 0,
         )
 
         print(f"Train set: {train_size} samples, Val set: {val_size} samples")
@@ -697,6 +699,7 @@ def create_dataloader(
             shuffle=shuffle,
             num_workers=num_workers,
             pin_memory=True,
+            persistent_workers=num_workers > 0,
         )
         return train_loader, None
 

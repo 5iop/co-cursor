@@ -707,6 +707,7 @@ def main():
         sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
     )
 
     val_loader = DataLoader(
@@ -716,6 +717,7 @@ def main():
         sampler=val_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
     ) if val_size > 0 else None
 
     if is_main_process():
