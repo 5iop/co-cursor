@@ -141,14 +141,43 @@ def extract_trajectory_features(trajectory: np.ndarray) -> np.ndarray:
     return features
 
 
-def load_human_trajectories(data_dir: str, max_samples: int = 1000) -> np.ndarray:
-    """加载人类轨迹并提取特征（使用 lazy 模式避免全量加载）"""
-    print(f"Loading human trajectories from {data_dir}...")
+def load_human_trajectories(
+    boun_dir: str = None,
+    open_images_dir: str = None,
+    sapimouse_dir: str = None,
+    max_samples: int = 1000,
+) -> tuple:
+    """
+    加载人类轨迹并提取特征（使用 lazy 模式避免全量加载）
+
+    Args:
+        boun_dir: BOUN 数据集目录
+        open_images_dir: Open Images 数据集目录
+        sapimouse_dir: SapiMouse 数据集目录
+        max_samples: 最大样本数
+
+    Returns:
+        features: (N, n_features) 特征数组
+        sources: (N,) 每个样本的来源标签 ('boun', 'open_images', 'sapimouse')
+    """
+    print(f"Loading human trajectories...")
+    if boun_dir:
+        print(f"  BOUN: {boun_dir}")
+    if open_images_dir:
+        print(f"  Open Images: {open_images_dir}")
+    if sapimouse_dir:
+        print(f"  SapiMouse: {sapimouse_dir}")
+
+    # 检查目录是否存在
+    boun_path = Path(boun_dir) if boun_dir else None
+    open_images_path = Path(open_images_dir) if open_images_dir else None
+    sapimouse_path = Path(sapimouse_dir) if sapimouse_dir else None
 
     # 使用 lazy=True 避免一次性加载所有数据到内存
     dataset = CombinedMouseDataset(
-        boun_dir=data_dir if Path(data_dir).exists() else None,
-        open_images_dir=data_dir if Path(data_dir).exists() else None,
+        sapimouse_dir=str(sapimouse_path) if sapimouse_path and sapimouse_path.exists() else None,
+        boun_dir=str(boun_path) if boun_path and boun_path.exists() else None,
+        open_images_dir=str(open_images_path) if open_images_path and open_images_path.exists() else None,
         max_length=500,
         lazy=True,  # 懒加载模式，按需读取
     )
@@ -161,6 +190,7 @@ def load_human_trajectories(data_dir: str, max_samples: int = 1000) -> np.ndarra
         indices = np.arange(total_size)
 
     features_list = []
+    sources_list = []
     for i in tqdm(indices, desc="Extracting human features"):
         sample = dataset[i]
         traj = sample['trajectory'].numpy()
@@ -170,8 +200,9 @@ def load_human_trajectories(data_dir: str, max_samples: int = 1000) -> np.ndarra
         feat = extract_trajectory_features(traj_valid)
         if feat is not None:
             features_list.append(feat)
+            sources_list.append(sample.get('source', 'unknown'))
 
-    return np.array(features_list)
+    return np.array(features_list), np.array(sources_list)
 
 
 def generate_model_trajectories(
@@ -287,13 +318,21 @@ def plot_tsne_distribution(
     model_name: str = "DMTG",
     label: str = None,
     alpha_labels: np.ndarray = None,
+    human_sources: np.ndarray = None,
     no_display: bool = False,
 ):
     """
     绘制 t-SNE 分布图 (论文 Fig. 6 风格)
 
-    左侧: 模型分布（不同 alpha 用不同颜色）
-    右侧: 人类分布
+    Args:
+        human_features: 人类轨迹特征
+        model_features: 模型轨迹特征
+        save_path: 保存路径
+        model_name: 模型名称
+        label: 实验标签
+        alpha_labels: 模型样本的 alpha 标签
+        human_sources: 人类样本的来源标签 ('boun' 或 'open_images')
+        no_display: 是否禁用显示
     """
     # 验证输入
     if len(human_features) == 0:
@@ -305,6 +344,49 @@ def plot_tsne_distribution(
         return
 
     print(f"Human samples: {len(human_features)}, Model samples: {len(model_features)}")
+
+    # 特征对比分析
+    feature_names = [
+        'path_ratio',      # 0
+        'curvature',       # 1
+        'curvature_std',   # 2
+        'speed_std',       # 3
+        'speed_mean',      # 4
+        'log(length)',     # 5
+        'direction_entropy', # 6
+        'bbox_area',       # 7
+        'complexity',      # 8
+        'straight_dist',   # 9
+    ]
+
+    print("\n" + "=" * 70)
+    print("特征对比分析 (Human vs Model)")
+    print("=" * 70)
+    print(f"{'特征':<18} {'Human Mean':>12} {'Model Mean':>12} {'差异':>10} {'Human Std':>12} {'Model Std':>12}")
+    print("-" * 70)
+
+    human_mean = human_features.mean(axis=0)
+    model_mean = model_features.mean(axis=0)
+    human_std = human_features.std(axis=0)
+    model_std = model_features.std(axis=0)
+
+    # 计算每个特征的差异程度（用标准化差异）
+    feature_diffs = []
+    for i, name in enumerate(feature_names):
+        diff = model_mean[i] - human_mean[i]
+        # 用人类数据的标准差来标准化差异
+        norm_diff = diff / (human_std[i] + 1e-8)
+        feature_diffs.append((name, abs(norm_diff), diff, human_mean[i], model_mean[i], human_std[i], model_std[i]))
+        print(f"{name:<18} {human_mean[i]:>12.4f} {model_mean[i]:>12.4f} {diff:>+10.4f} {human_std[i]:>12.4f} {model_std[i]:>12.4f}")
+
+    # 按差异程度排序，找出最大差异的特征
+    feature_diffs.sort(key=lambda x: x[1], reverse=True)
+    print("\n--- 差异最大的特征 (按标准化差异排序) ---")
+    for name, norm_diff, diff, h_mean, m_mean, h_std, m_std in feature_diffs[:5]:
+        direction = "偏高" if diff > 0 else "偏低"
+        print(f"  {name}: 模型{direction} {abs(norm_diff):.2f} 个标准差 (Human: {h_mean:.4f}, Model: {m_mean:.4f})")
+
+    print("=" * 70 + "\n")
 
     setup_chinese_font()
 
@@ -340,8 +422,14 @@ def plot_tsne_distribution(
         fig.suptitle(f'实验: {label}', fontsize=16, fontweight='bold')
 
     # 设置颜色
-    human_color = '#2E86AB'  # 蓝色
-    # 不同 alpha 的颜色映射
+    # 人类数据来源颜色
+    human_source_colors = {
+        'boun': '#2E86AB',        # 蓝色
+        'open_images': '#28A745', # 绿色
+        'sapimouse': '#6F42C1',   # 紫色
+        'unknown': '#6C757D',     # 灰色
+    }
+    # 模型 alpha 颜色映射
     alpha_colors = {
         0.3: '#FF9999',  # 粉红
         0.5: '#F18F01',  # 橙色
@@ -350,8 +438,18 @@ def plot_tsne_distribution(
     }
     default_model_color = '#E94F37'
 
-    # 模型分布 (叠加人类分布作为参考)
-    ax.scatter(human_emb[:, 0], human_emb[:, 1], c=human_color, alpha=0.2, s=10, label='Human (ref)')
+    # 人类分布（按来源区分颜色）
+    if human_sources is not None and len(human_sources) == len(human_emb):
+        unique_sources = sorted(set(human_sources))
+        for source in unique_sources:
+            mask = human_sources == source
+            color = human_source_colors.get(source, human_source_colors['unknown'])
+            ax.scatter(human_emb[mask, 0], human_emb[mask, 1],
+                      c=color, alpha=0.3, s=10, label=f'Human ({source})')
+    else:
+        # 无来源信息时，统一显示为蓝色
+        ax.scatter(human_emb[:, 0], human_emb[:, 1],
+                  c=human_source_colors['boun'], alpha=0.3, s=10, label='Human')
 
     if alpha_labels is not None and len(alpha_labels) == len(model_emb):
         # 按不同 alpha 值分别绘制
@@ -420,8 +518,12 @@ def main():
 
     parser.add_argument("--checkpoint", "-c", type=str, default="checkpoints/best_model.pt",
                        help="Model checkpoint path (default: checkpoints/best_model.pt)")
-    parser.add_argument("--human_data", type=str, default="datasets/boun-processed",
-                       help="Human trajectory data directory")
+    parser.add_argument("--boun_data", type=str, default="datasets/boun-processed",
+                       help="BOUN trajectory data directory")
+    parser.add_argument("--open_images_data", type=str, default="datasets/open_images_v6",
+                       help="Open Images trajectory data directory")
+    parser.add_argument("--sapimouse_data", type=str, default="datasets/sapimouse",
+                       help="SapiMouse trajectory data directory")
     parser.add_argument("--num_human", type=int, default=500,
                        help="Number of human samples")
     parser.add_argument("--num_model", type=int, default=500,
@@ -481,31 +583,19 @@ def main():
 
     # 加载人类轨迹
     base_dir = Path(__file__).parent
-    human_data_path = base_dir / args.human_data
+    boun_path = base_dir / args.boun_data if args.boun_data else None
+    open_images_path = base_dir / args.open_images_data if args.open_images_data else None
+    sapimouse_path = base_dir / args.sapimouse_data if args.sapimouse_data else None
 
-    if human_data_path.exists():
-        human_features = load_human_trajectories(str(human_data_path), args.num_human)
-    else:
-        print(f"Warning: Human data not found at {human_data_path}")
-        print("Generating synthetic human data for demo...")
-        # 生成模拟的人类数据用于演示
-        human_features = []
-        for _ in range(args.num_human):
-            # 模拟人类轨迹特征
-            feat = np.array([
-                np.random.lognormal(0.3, 0.3),  # path_ratio
-                np.random.exponential(0.2),      # curvature
-                np.random.exponential(0.1),      # curvature_std
-                np.random.exponential(0.02),     # speed_std
-                np.random.exponential(0.01),     # speed_mean
-                np.random.uniform(3, 6),         # log(length)
-                np.random.uniform(1, 2),         # direction_entropy
-                np.random.uniform(0.01, 0.3),    # bbox_area
-                np.random.beta(2, 5),            # complexity
-                np.random.uniform(0.1, 1.0),     # straight_dist
-            ])
-            human_features.append(feat)
-        human_features = np.array(human_features)
+    human_features, human_sources = load_human_trajectories(
+        boun_dir=str(boun_path) if boun_path else None,
+        open_images_dir=str(open_images_path) if open_images_path else None,
+        sapimouse_dir=str(sapimouse_path) if sapimouse_path else None,
+        max_samples=args.num_human,
+    )
+
+    if len(human_features) == 0:
+        print("Warning: No human data loaded. Only model trajectories will be shown.")
 
     # 生成模型轨迹
     model_features, alpha_labels = generate_model_trajectories(
@@ -521,6 +611,7 @@ def main():
         model_name="DMTG",
         label=args.label,
         alpha_labels=alpha_labels,
+        human_sources=human_sources,
         no_display=args.no_display,
     )
 

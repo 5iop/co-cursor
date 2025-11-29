@@ -464,6 +464,7 @@ class CombinedMouseDataset(Dataset):
         self.max_length = max_length
         self.lazy = lazy
         self.datasets = []
+        self.dataset_names = []  # 记录每个子数据集的名称
 
         if sapimouse_dir:
             # SapiMouse不支持lazy（CSV格式）
@@ -476,6 +477,7 @@ class CombinedMouseDataset(Dataset):
                     lazy=False,  # CSV格式不支持lazy
                 )
             )
+            self.dataset_names.append("sapimouse")
 
         if boun_dir:
             boun_path = Path(boun_dir)
@@ -490,6 +492,7 @@ class CombinedMouseDataset(Dataset):
                         lazy=lazy,
                     )
                 )
+                self.dataset_names.append("boun")
             elif list(boun_path.glob("*.jsonl")):
                 # 回退到JSONL格式（不支持lazy）
                 self.datasets.append(
@@ -501,6 +504,7 @@ class CombinedMouseDataset(Dataset):
                         lazy=False,
                     )
                 )
+                self.dataset_names.append("boun")
             else:
                 print(f"Warning: No BOUN data found in {boun_dir}")
 
@@ -518,6 +522,7 @@ class CombinedMouseDataset(Dataset):
                         lazy=lazy,
                     )
                 )
+                self.dataset_names.append("open_images")
             elif list(open_images_path.glob("*.jsonl")):
                 # 回退到 JSONL 格式（不支持lazy）
                 self.datasets.append(
@@ -529,6 +534,7 @@ class CombinedMouseDataset(Dataset):
                         lazy=False,
                     )
                 )
+                self.dataset_names.append("open_images")
             else:
                 print(f"Warning: No Open Images data found in {open_images_dir}")
 
@@ -586,7 +592,9 @@ class CombinedMouseDataset(Dataset):
         if self.lazy:
             # Lazy模式：通过子dataset获取数据
             ds_idx, local_idx = self._find_dataset_and_local_idx(idx)
-            return self.datasets[ds_idx][local_idx]
+            result = self.datasets[ds_idx][local_idx]
+            result['source'] = self.dataset_names[ds_idx]  # 添加来源标签
+            return result
         else:
             # Eager模式：直接从合并的轨迹列表获取
             item = self.all_trajectories[idx]

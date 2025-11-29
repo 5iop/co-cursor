@@ -181,11 +181,12 @@ class DMTGLoss(nn.Module):
         # MST 比率 (路径长度 / 直线距离)
         mst_ratio = path_length / straight_dist  # (batch,)
 
-        # 计算预测复杂度 - 与 compute_trajectory_alpha 保持一致
-        # pred_complexity = (ratio - 1) / 2，clamp 到 [0, 1]
+        # 计算预测复杂度 (论文风格，无 clamp 避免梯度消失)
+        # pred_complexity = (ratio - 1) / ratio = 1 - 1/ratio
         # ratio=1 (直线) -> complexity=0
-        # ratio=3 -> complexity=1
-        pred_complexity = torch.clamp((mst_ratio - 1.0) / 2.0, 0.0, 1.0)
+        # ratio=2 -> complexity=0.5
+        # ratio→∞ -> complexity→1 (渐近，梯度 1/ratio² 永不为0)
+        pred_complexity = (mst_ratio - 1.0) / mst_ratio
 
         # Lstyle = ||α - pred_complexity||² (论文 Eq.13)
         style_loss = F.mse_loss(pred_complexity, alpha)

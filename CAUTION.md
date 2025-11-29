@@ -2,53 +2,42 @@
 
 ## Style Loss 公式问题
 
-**状态**: 待验证
+**状态**: 已回滚 (clamp 版本导致梯度消失)
 
 **改动位置**:
 - `src/models/losses.py` - `_style_loss` 函数
-- `tests/test_losses.py` - `test_style_loss_complexity_formula` 测试
 
-**改动内容**:
+**问题分析**:
 
-将 `pred_complexity` 公式从:
+曾尝试将 `pred_complexity` 公式改为:
 ```python
-# 旧公式: β/(β+1)，其中 β = ratio - 1
-pred_complexity = (mst_ratio - 1.0) / mst_ratio
-```
-
-改为:
-```python
-# 新公式: (ratio - 1) / 2，与 compute_trajectory_alpha 一致
+# 有问题的公式: clamp 导致梯度消失
 pred_complexity = torch.clamp((mst_ratio - 1.0) / 2.0, 0.0, 1.0)
 ```
 
-**改动原因**:
+**为什么 clamp 版本有问题**:
 
-为了让 `_style_loss` 中的复杂度计算与 `compute_trajectory_alpha` 保持一致:
-- `compute_trajectory_alpha`: `alpha = (ratio - 1) / 2`
-- 旧 `pred_complexity`: `(ratio - 1) / ratio` (即 `β/(β+1)`)
+1. 当 `ratio > 3` 时，`(ratio - 1) / 2 > 1.0`
+2. `clamp(..., 1.0)` 强制截断为 1.0
+3. **在截断区域，clamp 的梯度为 0**
+4. 模型无法对高复杂度轨迹 (ratio > 3) 进行优化
 
-当 ratio=3 时:
-- `compute_trajectory_alpha` 返回 `alpha = 1.0`
-- 旧 `pred_complexity` 返回 `0.67`
+**论文参考 (Eq.13)**:
 
-这种不一致可能导致训练时的目标不匹配。
+论文直接使用 `ratio = path_length / straight_dist`，**不做 clamp**。
 
-**潜在问题**:
+**当前正确实现**:
 
-此改动可能影响模型训练效果，需要验证:
-1. t-SNE 分布是否正常
-2. 生成轨迹质量是否下降
-3. style loss 的收敛情况
-
-**回滚方法**:
-
-如需回滚，将 `src/models/losses.py` 中的公式改回:
 ```python
+# 旧公式: (ratio - 1) / ratio = 1 - 1/ratio
+# ratio=1 → 0, ratio=2 → 0.5, ratio→∞ → 1
+# 梯度: 1/ratio²，永远不为 0
 pred_complexity = (mst_ratio - 1.0) / mst_ratio
 ```
 
-并更新 `tests/test_losses.py` 中的测试。
+这个公式的优点:
+- 渐近趋向 1，但梯度永不为 0
+- 对任意 ratio 值都能提供优化方向
 
 ---
 
