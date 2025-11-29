@@ -2,17 +2,24 @@
 DMTG 轨迹生成测试脚本
 测试训练好的模型生成人类风格鼠标轨迹
 """
+import sys
+import argparse
+
+# 解析参数以决定是否使用 Agg 后端（必须在 import matplotlib.pyplot 之前）
+_temp_parser = argparse.ArgumentParser(add_help=False)
+_temp_parser.add_argument("--no_display", action="store_true")
+_temp_args, _ = _temp_parser.parse_known_args()
+
+if _temp_args.no_display:
+    import matplotlib
+    matplotlib.use('Agg')  # 无 GUI 后端，避免 X11 依赖
+
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from pathlib import Path
-import argparse
 from datetime import datetime
 import platform
-import tkinter as tk
-from tkinter import ttk
 
 from src.models.alpha_ddim import create_alpha_ddim, EntropyController
 
@@ -38,6 +45,11 @@ def show_figure_with_scroll(fig, title="DMTG 轨迹生成结果"):
     """
     在带滚动条的窗口中显示 matplotlib 图表
     """
+    # 延迟导入 tkinter（只在需要显示时）
+    import tkinter as tk
+    from tkinter import ttk
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
     # 创建主窗口
     root = tk.Tk()
     root.title(title)
@@ -426,6 +438,89 @@ def plot_combined_results(results: list, save_path: str = None, effective_length
     show_figure_with_scroll(fig, title=f"DMTG 轨迹生成结果{m_str}")
 
 
+def plot_combined_results_no_display(results: list, save_path: str = None, effective_length: int = None, label: str = None):
+    """
+    绘制综合结果图（不显示窗口，仅保存文件）
+    用于后台执行
+    """
+    alphas = sorted(set(r['alpha'] for r in results))
+    n_alphas = len(alphas)
+
+    # 创建大图: 上面是轨迹，下面是指标
+    fig = plt.figure(figsize=(5 * n_alphas, 10))
+
+    # 添加总标题（如果有 label）
+    if label:
+        fig.suptitle(f'实验: {label}', fontsize=16, fontweight='bold')
+
+    # 上半部分：按 alpha 分组的轨迹
+    for i, alpha in enumerate(alphas):
+        ax = fig.add_subplot(2, n_alphas, i + 1)
+        alpha_results = [r for r in results if r['alpha'] == alpha]
+
+        for r in alpha_results:
+            traj = r['trajectory']
+            ax.plot(traj[:, 0], traj[:, 1], linewidth=1.5, alpha=0.7)
+            ax.scatter(traj[0, 0], traj[0, 1], c='green', s=80, zorder=5)
+            ax.scatter(traj[-1, 0], traj[-1, 1], c='red', s=80, zorder=5)
+
+        avg_ratio = np.mean([r['metrics']['path_ratio'] for r in alpha_results])
+        avg_curv = np.mean([r['metrics']['curvature'] for r in alpha_results])
+
+        m_str = f", m={effective_length}" if effective_length else ""
+        ax.set_title(f'α={alpha}{m_str}\n路径比={avg_ratio:.2f}, 曲率={avg_curv:.3f}')
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+
+    # 下半部分：指标对比
+    metrics_by_alpha = {}
+    for alpha in alphas:
+        alpha_results = [r for r in results if r['alpha'] == alpha]
+        metrics_by_alpha[alpha] = {
+            'path_ratio': [r['metrics']['path_ratio'] for r in alpha_results],
+            'curvature': [r['metrics']['curvature'] for r in alpha_results],
+            'speed_std': [r['metrics']['speed_std'] for r in alpha_results],
+        }
+
+    ax = fig.add_subplot(2, 3, 4)
+    data = [metrics_by_alpha[a]['path_ratio'] for a in alphas]
+    ax.boxplot(data, labels=[f'{a}' for a in alphas])
+    ax.set_xlabel('Alpha')
+    ax.set_ylabel('路径比率')
+    ax.set_title('路径比率 vs Alpha')
+    ax.grid(True, alpha=0.3)
+
+    ax = fig.add_subplot(2, 3, 5)
+    data = [metrics_by_alpha[a]['curvature'] for a in alphas]
+    ax.boxplot(data, labels=[f'{a}' for a in alphas])
+    ax.set_xlabel('Alpha')
+    ax.set_ylabel('曲率 (rad)')
+    ax.set_title('曲率 vs Alpha')
+    ax.grid(True, alpha=0.3)
+
+    ax = fig.add_subplot(2, 3, 6)
+    data = [metrics_by_alpha[a]['speed_std'] for a in alphas]
+    ax.boxplot(data, labels=[f'{a}' for a in alphas])
+    ax.set_xlabel('Alpha')
+    ax.set_ylabel('速度标准差')
+    ax.set_title('速度变化 vs Alpha')
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if label:
+        plt.subplots_adjust(top=0.93)
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"已保存: {save_path}")
+
+    plt.close(fig)
+
+
 def print_metrics_table(results: list):
     """打印指标表格"""
     print("\n" + "=" * 70)
@@ -452,7 +547,7 @@ def main():
     parser = argparse.ArgumentParser(description="Test DMTG trajectory generation")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt",
                        help="Path to model checkpoint")
-    parser.add_argument("--device", type=str, default="cuda",
+    parser.add_argument("--device", type=str, default="cpu",
                        help="Device to use")
     parser.add_argument("--num_samples", type=int, default=5,
                        help="Number of samples per configuration")
@@ -460,6 +555,10 @@ def main():
                        help="Output directory for plots")
     parser.add_argument("--effective_length", "-m", type=int, default=None,
                        help="Effective trajectory length (node count m)")
+    parser.add_argument("--label", "-l", type=str, default=None,
+                       help="Label for this experiment (appended to output filename)")
+    parser.add_argument("--no_display", action="store_true",
+                       help="Don't display the plot (useful for background execution)")
     args = parser.parse_args()
 
     # 创建输出目录
@@ -555,8 +654,12 @@ def main():
     # 打印指标
     print_metrics_table(all_results)
 
-    # 生成时间戳
+    # 生成时间戳和文件名
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.label:
+        filename = f"generate_{args.label}.png"
+    else:
+        filename = f"generate_{timestamp}.png"
 
     # 绘制图表
     print("\n正在生成图表...")
@@ -564,13 +667,24 @@ def main():
     # 综合图：轨迹 + 指标合并显示
     # 如果使用自动长度，传入 "auto"；否则传入指定的长度
     eff_len_display = "auto" if args.effective_length is None else args.effective_length
-    plot_combined_results(
-        all_results,
-        save_path=output_dir / f"combined_results_{timestamp}.png",
-        effective_length=eff_len_display
-    )
+    save_path = output_dir / filename
 
-    print(f"\n图表已保存到 {output_dir}/")
+    if args.no_display:
+        # 不显示窗口，只保存文件
+        plot_combined_results_no_display(
+            all_results,
+            save_path=save_path,
+            effective_length=eff_len_display,
+            label=args.label,
+        )
+    else:
+        plot_combined_results(
+            all_results,
+            save_path=save_path,
+            effective_length=eff_len_display,
+        )
+
+    print(f"\n图表已保存到 {save_path}")
     print("完成!")
 
 

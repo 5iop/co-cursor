@@ -169,9 +169,9 @@ class AlphaDDIM(nn.Module):
         direction_norm = torch.norm(direction, dim=-1, keepdim=True) + 1e-8
         direction_unit = direction / direction_norm  # 单位方向向量 d̂
 
-        # 论文 Eq.4: k_c 缩放因子
-        # 归一化坐标下最大距离为 sqrt(2)，k_c ∈ [0, 1]
-        kc = direction_norm / (1.414 + 1e-8)  # sqrt(2) ≈ 1.414
+        # 论文 Eq.4: k_c 是常数缩放因子 (论文推荐值 ≈ 1/6)
+        # 注意: k_c 应该是常数，而非距离的函数
+        kc = 1.0 / 6.0
 
         # DDIM 噪声方差 (标准 DDIM 公式)
         sigma_squared = eta ** 2 * (
@@ -181,11 +181,12 @@ class AlphaDDIM(nn.Module):
 
         # ========== 从混合协方差采样 ==========
         # 论文 Eq.4: z_d ~ N(0, Σ_d) 其中 Σ_d = (k_c·||d||)²·(d̂⊗d̂)
-        # 方向协方差是秩1矩阵，采样为: z_d = (k_c·||d||) · ε_1 · d̂
-        # 其中 ε_1 ~ N(0, 1) 是标量
+        # 方向协方差是秩1矩阵，标准差为 σ_d = k_c·||d||
+        # 采样为: z_d = σ_d · ε_1 · d̂，其中 ε_1 ~ N(0, 1) 是标量
         noise_scalar = torch.randn(batch_size, self.seq_length, 1, device=x_t.device)
         direction_unit_expanded = direction_unit.unsqueeze(1)  # (batch, 1, 2)
-        sigma_d = (kc * direction_norm).unsqueeze(1)  # (batch, 1, 1) - 直接使用，不取sqrt
+        # 标准差 σ_d = k_c · ||d|| (从协方差 Σ_d = σ_d² · (d̂⊗d̂) 得到)
+        sigma_d = (kc * direction_norm).unsqueeze(1)  # (batch, 1, 1)
         z_d = sigma_d * noise_scalar * direction_unit_expanded  # (batch, seq, 2)
 
         # 论文 Eq.5: z_n ~ N(0, Σ_n) 其中 Σ_n = σ²_n·I
@@ -217,7 +218,7 @@ class AlphaDDIM(nn.Module):
         alpha: float = 0.5,
         eta: float = 0.5,  # 默认启用随机性以支持双协方差混合
         device: str = "cuda",
-        effective_length: int = None,  # 有效轨迹长度 m (论文 Eq.1-3)
+        effective_length=None,  # 有效轨迹长度 m，支持 int 或 Tensor (batch,)
         use_entropy_stopping: bool = True,  # 是否使用熵控制早停
         auto_length: bool = False,  # 是否自动预测轨迹长度
     ) -> torch.Tensor:
@@ -236,8 +237,10 @@ class AlphaDDIM(nn.Module):
             alpha: 目标复杂度 (0-1，采样时约束到 0.3-0.8)
             eta: DDIM随机性参数
             device: 设备
-            effective_length: 有效轨迹长度 m (默认 None 使用 seq_length)
-                             如果 m < seq_length，超出部分将是零填充
+            effective_length: 有效轨迹长度，支持:
+                - None: 使用 seq_length
+                - int: 所有样本使用相同长度
+                - Tensor (batch,): 每个样本使用不同长度 (per-sample)
             use_entropy_stopping: 是否使用 MST 熵控制早停
             auto_length: 是否自动预测轨迹长度 (需要模型启用 enable_length_prediction)
                         如果为 True 且 effective_length 为 None，则自动预测长度
@@ -253,22 +256,32 @@ class AlphaDDIM(nn.Module):
         # α = 1: 最复杂曲线轨迹
         alpha_clamped = max(0.0, min(1.0, alpha))
 
-        # 自动长度预测
+        # 自动长度预测 (Shared Encoder 模式)
         # 如果 auto_length=True 且 effective_length 未指定，则使用模型预测长度
         predicted_lengths = None
         if auto_length and effective_length is None:
             if hasattr(self.model, 'length_head') and self.model.length_head is not None:
                 # 构建 alpha tensor
                 alpha_tensor = torch.full((batch_size,), alpha_clamped, device=device, dtype=torch.float32)
+                # 创建初始输入 (t=0 时刻的噪声轨迹) 用于 Shared Encoder 长度预测
+                x_init = torch.randn(batch_size, self.seq_length, self.input_dim, device=device)
                 # 预测长度
-                log_length = self.model.predict_length(condition, alpha_tensor)
+                log_length = self.model.predict_length(x_init, condition, alpha_tensor)
                 predicted_lengths = self.model.decode_length(log_length, max_length=self.seq_length)
-                # 对于批次采样，使用第一个预测长度（或者可以对每个样本使用不同长度）
-                # 这里简化处理：使用批次的平均长度
-                effective_length = int(predicted_lengths.float().mean().item())
+                # 使用 per-sample 长度
+                effective_length = predicted_lengths
             else:
                 # 模型不支持长度预测，回退到使用全长
                 pass
+
+        # 处理 effective_length 的不同类型
+        is_per_sample = isinstance(effective_length, torch.Tensor)
+
+        # 统一处理长度：确保最小长度为 2，避免数值不稳定
+        if is_per_sample:
+            effective_length = effective_length.long().to(device).clamp(min=2)
+        elif effective_length is not None:
+            effective_length = max(2, effective_length)
 
         # 论文 Eq.2-3: 掩码初始化，支持距离缩放噪声和可控长度
         x = self._initialize_with_condition(
@@ -286,6 +299,12 @@ class AlphaDDIM(nn.Module):
             min_steps=max(5, num_inference_steps // 4),
             use_full_entropy=True,  # 使用完整 MST 熵公式
         )
+
+        # 预计算 per-sample padding mask (如果是 per-sample 模式)
+        if is_per_sample:
+            # effective_length 已经在上面被转换为 long tensor 并 clamp 过
+            seq_indices = torch.arange(self.seq_length, device=device).unsqueeze(0)  # (1, seq_length)
+            per_sample_padding_mask = (seq_indices < effective_length.unsqueeze(1)).float().unsqueeze(2)  # (batch, seq_length, 1)
 
         for i, t in enumerate(timesteps):
             t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
@@ -307,16 +326,23 @@ class AlphaDDIM(nn.Module):
             # 论文 Eq.2: 边界约束 (inpainting)
             x = self._enforce_boundary_inpainting(x, condition, t, self.timesteps, effective_length)
 
-            # 如果有 effective_length，保持零填充
-            if effective_length and effective_length < self.seq_length:
+            # 保持零填充
+            if is_per_sample:
+                # Per-sample padding
+                x = x * per_sample_padding_mask
+            elif effective_length is not None and effective_length < self.seq_length:
+                # 统一 int padding
                 padding_mask = torch.zeros(batch_size, self.seq_length, 1, device=device)
                 padding_mask[:, :effective_length, :] = 1.0
                 x = x * padding_mask
 
             # 论文 Eq.8-9: 检查是否达到目标复杂度
             if use_entropy_stopping and i >= entropy_controller.min_steps:
-                # 只检查有效部分的复杂度
-                if effective_length and effective_length < self.seq_length:
+                # 只检查有效部分的复杂度 (per-sample 时使用最小长度)
+                if is_per_sample:
+                    min_length = int(effective_length.min().item())
+                    x_valid = x[:, :min_length, :]
+                elif effective_length is not None and effective_length < self.seq_length:
                     x_valid = x[:, :effective_length, :]
                 else:
                     x_valid = x
@@ -337,7 +363,7 @@ class AlphaDDIM(nn.Module):
         batch_size: int,
         condition: torch.Tensor,
         device: str,
-        effective_length: int = None,  # 有效轨迹长度 m
+        effective_length=None,  # 有效轨迹长度 m，支持 int 或 Tensor (batch,)
     ) -> torch.Tensor:
         """
         按论文 Eq.(2-3) 初始化: X_R = M ⊙ X_c + (1-M) ⊙ ε
@@ -351,6 +377,12 @@ class AlphaDDIM(nn.Module):
         其中 k_c ≈ 1/6 (论文推荐值)
 
         最终结果: 边界点固定为条件值，中间点为距离缩放的噪声
+
+        Args:
+            effective_length: 有效轨迹长度，支持:
+                - None: 使用 seq_length
+                - int: 所有样本使用相同长度
+                - Tensor (batch,): 每个样本使用不同长度 (per-sample)
         """
         start_point = condition[:, :2]  # (batch, 2)
         end_point = condition[:, 2:]    # (batch, 2)
@@ -358,52 +390,79 @@ class AlphaDDIM(nn.Module):
         # 计算起终点距离 (论文 Eq.3)
         distance = torch.norm(end_point - start_point, dim=-1, keepdim=True)  # (batch, 1)
 
-        # 有效轨迹长度
-        m = effective_length if effective_length else self.seq_length
+        # 处理 effective_length 的不同类型
+        is_per_sample = isinstance(effective_length, torch.Tensor)
 
-        # 论文 Eq.3: σ_ε = k_c · ||d|| / √(m-1)
-        # k_c ≈ 1/6 是论文推荐值
-        k_sigma = 1.0 / 6.0
-        sigma_epsilon = k_sigma * distance / (np.sqrt(m - 1) + 1e-8)  # (batch, 1)
-        sigma_epsilon = sigma_epsilon.unsqueeze(1)  # (batch, 1, 1) for broadcasting
+        if is_per_sample:
+            # Per-sample 长度: Tensor (batch,)
+            # 注意: 调用者 (sample()) 已经确保 effective_length >= 2
+            lengths = effective_length.long().to(device)
+            m_float = lengths.float().unsqueeze(1)  # (batch, 1) for sigma calculation
+        elif effective_length is not None:
+            # 统一 int 长度
+            # 注意: 调用者 (sample()) 已经确保 effective_length >= 2
+            m_float = torch.full((batch_size, 1), float(effective_length), device=device)
+            lengths = None
+        else:
+            # 默认使用 seq_length
+            m_float = torch.full((batch_size, 1), float(self.seq_length), device=device)
+            lengths = None
+
+        # σ_ε = k_c · ||d|| / √(m-1)，其中 k_c = 1/6
+        # 除以 √(m-1) 是为了让每个点的噪声累积后保持合理的总体方差
+        k_c = 1.0 / 6.0
+        sigma_epsilon = k_c * distance / torch.sqrt(m_float - 1 + 1e-8)  # (batch, 1)
+        sigma_epsilon = sigma_epsilon.unsqueeze(2)  # (batch, 1, 1) for broadcasting
 
         # 创建掩码 M (论文 Eq.2)
-        # M[0] = 1 (起点), M[m-1] = 1 (终点), 其他 = 0
-        # 如果有效长度 < seq_length，后面的点用 zero padding
         mask = torch.zeros(batch_size, self.seq_length, 1, device=device)
         mask[:, 0, :] = 1.0   # 起点掩码
-
-        if effective_length and effective_length < self.seq_length:
-            # 使用有效长度的终点位置
-            end_idx = effective_length - 1
-            mask[:, end_idx, :] = 1.0
-        else:
-            mask[:, -1, :] = 1.0  # 终点掩码
 
         # 创建条件值 X_c
         x_c = torch.zeros(batch_size, self.seq_length, self.input_dim, device=device)
         x_c[:, 0, :] = start_point   # 起点
 
-        if effective_length and effective_length < self.seq_length:
+        if is_per_sample:
+            # Per-sample: 使用 scatter_ 设置每个样本的终点位置
+            end_indices = (lengths - 1).clamp(0, self.seq_length - 1)  # (batch,)
+            # 为 mask 设置终点
+            end_indices_mask = end_indices.view(batch_size, 1, 1)  # (batch, 1, 1)
+            mask.scatter_(1, end_indices_mask, 1.0)
+            # 为 x_c 设置终点
+            end_indices_xc = end_indices.view(batch_size, 1, 1).expand(-1, 1, self.input_dim)  # (batch, 1, 2)
+            x_c.scatter_(1, end_indices_xc, end_point.unsqueeze(1))
+        elif effective_length is not None and effective_length < self.seq_length:
+            # 统一 int 长度
             end_idx = effective_length - 1
+            mask[:, end_idx, :] = 1.0
             x_c[:, end_idx, :] = end_point
-            # 超出有效长度的部分保持为0 (zero padding)
         else:
-            x_c[:, -1, :] = end_point    # 终点
+            # 默认: 终点在最后
+            mask[:, -1, :] = 1.0
+            x_c[:, -1, :] = end_point
 
-        # 生成距离缩放的高斯噪声 ε (论文 Eq.3)
-        # 标准噪声 * σ_ε
+        # 生成距离缩放的高斯噪声 ε
         noise = torch.randn(batch_size, self.seq_length, self.input_dim, device=device)
         scaled_noise = noise * sigma_epsilon  # (batch, seq_len, 2)
 
-        # 对于 zero padding 部分，噪声也应该是 0
-        if effective_length and effective_length < self.seq_length:
+        # 中间点初始化为缩放噪声
+        # 注: 论文 Eq.3 建议使用 p_c + ε (中点 + 噪声)，但实测效果不佳，详见 CAUTION.md
+        middle_points = scaled_noise  # (batch, seq_len, 2)
+
+        # 创建 padding mask (有效部分为1，padding部分为0)
+        if is_per_sample:
+            # Per-sample padding mask
+            seq_indices = torch.arange(self.seq_length, device=device).unsqueeze(0)  # (1, seq_length)
+            padding_mask = (seq_indices < lengths.unsqueeze(1)).float().unsqueeze(2)  # (batch, seq_length, 1)
+            middle_points = middle_points * padding_mask
+        elif effective_length is not None and effective_length < self.seq_length:
             padding_mask = torch.zeros(batch_size, self.seq_length, 1, device=device)
             padding_mask[:, :effective_length, :] = 1.0
-            scaled_noise = scaled_noise * padding_mask
+            middle_points = middle_points * padding_mask
 
-        # 论文 Eq.(2): X_R = M ⊙ X_c + (1-M) ⊙ ε
-        x = mask * x_c + (1 - mask) * scaled_noise
+        # 使用 mask 组合边界点和中间点
+        # X_R = {p_0} ∥ {ε} ∥ {p_m} ∥ {0}
+        x = mask * x_c + (1 - mask) * middle_points
 
         return x
 
@@ -413,7 +472,7 @@ class AlphaDDIM(nn.Module):
         condition: torch.Tensor,
         t: int,
         total_timesteps: int,
-        effective_length: int = None,
+        effective_length=None,  # 支持 int 或 Tensor (batch,)
     ) -> torch.Tensor:
         """
         论文 Eq.(2) 风格的边界约束 (Inpainting)
@@ -423,26 +482,44 @@ class AlphaDDIM(nn.Module):
 
         M: 掩码 (边界点=1)
         X_c: 条件值 (起点/终点)
-        effective_length: 有效轨迹长度，终点在 effective_length-1 位置
+        effective_length: 有效轨迹长度，支持:
+            - None: 终点在 seq_length-1
+            - int: 所有样本终点在 effective_length-1
+            - Tensor (batch,): 每个样本终点位置不同 (per-sample)
         """
+        batch_size = x.shape[0]
+        device = x.device
         start_point = condition[:, :2]  # (batch, 2)
         end_point = condition[:, 2:]    # (batch, 2)
 
-        # 确定终点位置
-        if effective_length and effective_length < self.seq_length:
-            end_idx = effective_length - 1
-        else:
-            end_idx = self.seq_length - 1
+        # 处理 effective_length 的不同类型
+        is_per_sample = isinstance(effective_length, torch.Tensor)
 
         # 创建掩码 M
         mask = torch.zeros_like(x)
-        mask[:, 0, :] = 1.0       # 起点
-        mask[:, end_idx, :] = 1.0  # 终点
+        mask[:, 0, :] = 1.0  # 起点
 
         # 创建条件值 X_c
         x_c = torch.zeros_like(x)
         x_c[:, 0, :] = start_point
-        x_c[:, end_idx, :] = end_point
+
+        if is_per_sample:
+            # Per-sample: 使用 scatter_ 设置每个样本的终点
+            lengths = effective_length.long().to(device)
+            end_indices = (lengths - 1).clamp(0, self.seq_length - 1)  # (batch,)
+            # 为 mask 设置终点
+            end_indices_mask = end_indices.view(batch_size, 1, 1).expand(-1, 1, self.input_dim)
+            mask.scatter_(1, end_indices_mask, 1.0)
+            # 为 x_c 设置终点
+            x_c.scatter_(1, end_indices_mask, end_point.unsqueeze(1))
+        elif effective_length is not None and effective_length < self.seq_length:
+            end_idx = effective_length - 1
+            mask[:, end_idx, :] = 1.0
+            x_c[:, end_idx, :] = end_point
+        else:
+            end_idx = self.seq_length - 1
+            mask[:, end_idx, :] = 1.0
+            x_c[:, end_idx, :] = end_point
 
         # 应用掩码: x' = M ⊙ X_c + (1-M) ⊙ x
         x = mask * x_c + (1 - mask) * x
@@ -527,6 +604,7 @@ class AlphaDDIM(nn.Module):
         eta: float = 0.5,
         device: str = "cuda",
         use_entropy_stopping: bool = True,
+        use_per_sample_length: bool = True,  # 是否使用 per-sample 长度
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         使用自动长度预测生成轨迹
@@ -541,6 +619,9 @@ class AlphaDDIM(nn.Module):
             eta: DDIM随机性参数
             device: 设备
             use_entropy_stopping: 是否使用熵控制早停
+            use_per_sample_length: 是否使用 per-sample 长度 (默认 True)
+                - True: 每个样本使用模型预测的独立长度
+                - False: 使用批次平均长度 (向后兼容)
 
         Returns:
             (trajectories, predicted_lengths)
@@ -556,14 +637,20 @@ class AlphaDDIM(nn.Module):
         # 约束 alpha
         alpha_clamped = max(0.0, min(1.0, alpha))
 
-        # 预测长度
+        # 预测长度 (Shared Encoder 模式)
         alpha_tensor = torch.full((batch_size,), alpha_clamped, device=device, dtype=torch.float32)
-        log_length = self.model.predict_length(condition, alpha_tensor)
+        # 创建初始输入 (t=0 时刻的噪声轨迹) 用于 Shared Encoder 长度预测
+        x_init = torch.randn(batch_size, self.seq_length, self.input_dim, device=device)
+        log_length = self.model.predict_length(x_init, condition, alpha_tensor)
         predicted_lengths = self.model.decode_length(log_length, max_length=self.seq_length)
 
-        # 使用平均长度作为 effective_length (简化处理)
-        # 也可以对每个样本使用不同的长度，但需要更复杂的实现
-        effective_length = int(predicted_lengths.float().mean().item())
+        # 选择使用 per-sample 长度还是平均长度
+        if use_per_sample_length:
+            # Per-sample: 每个样本使用独立的预测长度
+            effective_length = predicted_lengths  # Tensor (batch,)
+        else:
+            # 向后兼容: 使用平均长度
+            effective_length = int(predicted_lengths.float().mean().item())
 
         # 生成轨迹
         trajectories = self.sample(
@@ -584,7 +671,7 @@ class AlphaDDIM(nn.Module):
         self,
         trajectory: torch.Tensor,
         condition: torch.Tensor,
-        effective_length: int = None,
+        effective_length=None,  # 支持 int 或 Tensor (batch,)
     ) -> torch.Tensor:
         """
         应用边界条件：确保轨迹的起点和终点与条件匹配
@@ -593,42 +680,102 @@ class AlphaDDIM(nn.Module):
         Args:
             trajectory: (batch, seq_len, 2)
             condition: (batch, 4) - [start_x, start_y, end_x, end_y]
-            effective_length: 有效轨迹长度 m，如果指定则只处理前 m 个点
+            effective_length: 有效轨迹长度，支持:
+                - None: 处理整个 seq_length
+                - int: 所有样本使用相同长度
+                - Tensor (batch,): 每个样本使用不同长度 (per-sample)
         """
         batch_size = trajectory.shape[0]
         device = trajectory.device
         start_point = condition[:, :2]  # (batch, 2)
         end_point = condition[:, 2:]  # (batch, 2)
 
-        # 确定有效长度
-        m = effective_length if effective_length else self.seq_length
+        # 处理 effective_length 的不同类型
+        is_per_sample = isinstance(effective_length, torch.Tensor)
 
-        # 创建平滑权重 (只对有效部分)
-        weights = torch.linspace(0, 1, m, device=device)
-        weights = weights.view(1, -1, 1).expand(batch_size, -1, 2)
+        if is_per_sample:
+            # Per-sample: 每个样本有不同的长度
+            lengths = effective_length.long().to(device)  # (batch,)
+            lengths_float = lengths.float().unsqueeze(1)  # (batch, 1)
 
-        # 获取有效部分
-        traj_valid = trajectory[:, :m, :]
+            # 创建 per-sample 权重: weights[i, j] = j / (lengths[i] - 1)
+            seq_indices = torch.arange(self.seq_length, device=device).float().unsqueeze(0)  # (1, seq_length)
+            weights = seq_indices / (lengths_float - 1).clamp(min=1)  # (batch, seq_length)
+            weights = weights.clamp(0, 1).unsqueeze(2)  # (batch, seq_length, 1)
 
-        # 计算当前起点和终点的偏移
-        current_start = traj_valid[:, 0:1, :]
-        current_end = traj_valid[:, -1:, :]
+            # 获取当前起点
+            current_start = trajectory[:, 0:1, :]  # (batch, 1, 2)
 
-        # 插值修正
-        start_correction = start_point.unsqueeze(1) - current_start
-        end_correction = end_point.unsqueeze(1) - current_end
+            # 获取每个样本的当前终点 (使用 gather)
+            end_indices = (lengths - 1).clamp(0, self.seq_length - 1)  # (batch,)
+            end_indices_expanded = end_indices.view(batch_size, 1, 1).expand(-1, 1, self.input_dim)
+            current_end = trajectory.gather(1, end_indices_expanded)  # (batch, 1, 2)
 
-        # 应用平滑修正
-        correction = start_correction * (1 - weights) + end_correction * weights
-        traj_valid = traj_valid + correction
+            # 插值修正
+            start_correction = start_point.unsqueeze(1) - current_start  # (batch, 1, 2)
+            end_correction = end_point.unsqueeze(1) - current_end  # (batch, 1, 2)
 
-        # 如果有 effective_length，保留原轨迹的零填充部分
-        if effective_length and effective_length < self.seq_length:
-            result = trajectory.clone()
-            result[:, :m, :] = traj_valid
+            # 应用平滑修正 (只在有效区域)
+            correction = start_correction * (1 - weights) + end_correction * weights  # (batch, seq_length, 2)
+
+            # 创建 padding mask
+            padding_mask = (seq_indices < lengths_float).float().unsqueeze(2)  # (batch, seq_length, 1)
+
+            # 只对有效部分应用修正
+            result = trajectory + correction * padding_mask
+
             return result
+
+        elif effective_length is not None:
+            # 统一 int 长度
+            m = effective_length
+
+            # 创建平滑权重 (只对有效部分)
+            weights = torch.linspace(0, 1, m, device=device)
+            weights = weights.view(1, -1, 1).expand(batch_size, -1, 2)
+
+            # 获取有效部分
+            traj_valid = trajectory[:, :m, :]
+
+            # 计算当前起点和终点的偏移
+            current_start = traj_valid[:, 0:1, :]
+            current_end = traj_valid[:, -1:, :]
+
+            # 插值修正
+            start_correction = start_point.unsqueeze(1) - current_start
+            end_correction = end_point.unsqueeze(1) - current_end
+
+            # 应用平滑修正
+            correction = start_correction * (1 - weights) + end_correction * weights
+            traj_valid = traj_valid + correction
+
+            # 保留原轨迹的零填充部分
+            if m < self.seq_length:
+                result = trajectory.clone()
+                result[:, :m, :] = traj_valid
+                return result
+            else:
+                return traj_valid
+
         else:
-            return traj_valid
+            # 默认: 处理整个 seq_length
+            m = self.seq_length
+
+            # 创建平滑权重
+            weights = torch.linspace(0, 1, m, device=device)
+            weights = weights.view(1, -1, 1).expand(batch_size, -1, 2)
+
+            # 计算当前起点和终点的偏移
+            current_start = trajectory[:, 0:1, :]
+            current_end = trajectory[:, -1:, :]
+
+            # 插值修正
+            start_correction = start_point.unsqueeze(1) - current_start
+            end_correction = end_point.unsqueeze(1) - current_end
+
+            # 应用平滑修正
+            correction = start_correction * (1 - weights) + end_correction * weights
+            return trajectory + correction
 
     def get_loss(
         self,
@@ -683,11 +830,11 @@ class AlphaDDIM(nn.Module):
             'alpha': alpha,
         }
 
-        # 长度预测损失
+        # 长度预测损失 (Shared Encoder 模式)
         if include_length_loss and length is not None:
             if hasattr(self.model, 'length_head') and self.model.length_head is not None:
-                # 预测 log(m+1)
-                predicted_log_length = self.model.predict_length(condition, alpha)
+                # 预测 log(m+1)，使用 x_t 作为 encoder 输入
+                predicted_log_length = self.model.predict_length(x_t, condition, alpha)
                 result['predicted_log_length'] = predicted_log_length
                 result['target_length'] = length
             else:

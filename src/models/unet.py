@@ -53,6 +53,7 @@ class DiscreteAlphaEmbedding(nn.Module):
         """
         Args:
             alpha: 连续α值 (batch,) 或 (batch, 1)，范围 [0, 1]
+                   (代码中 α 已通过 compute_trajectory_alpha 归一化到 [0, 1])
         Returns:
             嵌入向量 (batch, embedding_dim)
         """
@@ -61,6 +62,8 @@ class DiscreteAlphaEmbedding(nn.Module):
 
         # 将α离散化为bin索引
         # α ∈ [0, 1] -> bin ∈ [0, num_bins-1]
+        # 注：论文 Eq.10 的 α'=1/(α+1) 变换适用于原始 α∈[0,+∞)
+        #     但代码中 α 已归一化到 [0,1]，故不需要此变换
         bin_idx = (alpha * (self.num_bins - 1)).long().clamp(0, self.num_bins - 1)
 
         # 获取嵌入
@@ -72,22 +75,25 @@ class DiscreteAlphaEmbedding(nn.Module):
 
 class LengthPredictionHead(nn.Module):
     """
-    轨迹长度预测头
+    轨迹长度预测头 (Shared Encoder 模式)
 
-    基于条件编码（起点、终点）和α（复杂度）预测轨迹长度的对数值
+    使用 U-Net encoder 的 bottleneck 特征进行长度预测
     y = log(m + 1)
 
-    输入: 条件编码 + α编码
+    输入: encoder bottleneck 特征 (全局池化后) + 条件编码 + α编码
     输出: log(m + 1) 预测值
     """
 
     def __init__(
         self,
-        input_dim: int = 256,  # condition_dim + alpha_dim (通常是 time_emb_dim * 2)
+        encoder_dim: int,      # encoder bottleneck 通道数
+        condition_dim: int,    # 条件嵌入维度 (time_emb_dim)
         hidden_dim: int = 128,
         output_dim: int = 1,
     ):
         super().__init__()
+        # 输入: encoder_feature + condition_emb + alpha_emb
+        input_dim = encoder_dim + condition_dim * 2
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.SiLU(),
@@ -96,17 +102,23 @@ class LengthPredictionHead(nn.Module):
             nn.Linear(hidden_dim, output_dim),
         )
 
-    def forward(self, condition_emb: torch.Tensor, alpha_emb: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        encoder_feature: torch.Tensor,  # (batch, encoder_dim) - 全局池化后的特征
+        condition_emb: torch.Tensor,    # (batch, condition_dim)
+        alpha_emb: torch.Tensor,        # (batch, condition_dim)
+    ) -> torch.Tensor:
         """
         Args:
-            condition_emb: 条件编码 (batch, emb_dim)
-            alpha_emb: α编码 (batch, emb_dim)
+            encoder_feature: encoder bottleneck 特征 (batch, encoder_dim)
+            condition_emb: 条件编码 (batch, condition_dim)
+            alpha_emb: α编码 (batch, condition_dim)
 
         Returns:
             log_length: log(m+1) 预测值 (batch, 1)
         """
-        # 拼接条件和α编码
-        combined = torch.cat([condition_emb, alpha_emb], dim=-1)
+        # 拼接所有特征
+        combined = torch.cat([encoder_feature, condition_emb, alpha_emb], dim=-1)
         return self.mlp(combined)
 
 
@@ -311,12 +323,16 @@ class TrajectoryUNet(nn.Module):
             embedding_dim=time_emb_dim
         )
 
-        # 轨迹长度预测头
-        # 输入: condition_emb (time_emb_dim) + alpha_emb (time_emb_dim)
+        # 计算 encoder bottleneck 维度 (最深层通道数)
+        self.bottleneck_dim = base_channels * channel_mults[-1]
+
+        # 轨迹长度预测头 (Shared Encoder 模式)
+        # 输入: encoder bottleneck 特征 + condition_emb + alpha_emb
         # 输出: log(m+1) 预测值
         if enable_length_prediction:
             self.length_head = LengthPredictionHead(
-                input_dim=time_emb_dim * 2,  # condition + alpha
+                encoder_dim=self.bottleneck_dim,
+                condition_dim=time_emb_dim,
                 hidden_dim=time_emb_dim,
                 output_dim=1,
             )
@@ -425,20 +441,59 @@ class TrajectoryUNet(nn.Module):
         # 转换回 (batch, seq_len, 2)
         return h.transpose(1, 2)
 
-    def predict_length(
+    def _encode(
         self,
-        condition: torch.Tensor,  # (batch, 4) - 起点+终点
-        alpha: torch.Tensor,      # (batch,) 或 (batch, 1) - 复杂度参数
+        x: torch.Tensor,          # (batch, seq_len, 2)
+        time_emb: torch.Tensor,   # (batch, time_emb_dim)
     ) -> torch.Tensor:
         """
-        预测轨迹长度
+        运行 encoder 部分，获取 bottleneck 特征
 
-        基于条件（起点、终点）和α（复杂度）预测轨迹长度的对数值
+        Args:
+            x: 输入轨迹 (batch, seq_len, 2)
+            time_emb: 时间嵌入 (batch, time_emb_dim)
+
+        Returns:
+            bottleneck: encoder bottleneck 特征 (batch, bottleneck_dim)
+        """
+        # 转换为 (batch, channels, seq_len)
+        x = x.transpose(1, 2)
+
+        # 输入投影
+        h = self.input_proj(x)
+
+        # 下采样
+        for down_block in self.down_blocks:
+            h, _ = down_block(h, time_emb)
+
+        # 中间处理
+        h = self.mid_block1(h, time_emb)
+        h = self.mid_attention(h)
+        h = self.mid_block2(h, time_emb)
+
+        # 全局平均池化: (batch, channels, seq_len) -> (batch, channels)
+        bottleneck = h.mean(dim=-1)
+
+        return bottleneck
+
+    def predict_length(
+        self,
+        x: torch.Tensor,          # (batch, seq_len, 2) - 输入轨迹 (噪声或初始化)
+        condition: torch.Tensor,  # (batch, 4) - 起点+终点
+        alpha: torch.Tensor,      # (batch,) 或 (batch, 1) - 复杂度参数
+        time: torch.Tensor = None,  # (batch,) - 时间步 (默认 t=0)
+    ) -> torch.Tensor:
+        """
+        预测轨迹长度 (Shared Encoder 模式)
+
+        使用 U-Net encoder 特征 + 条件 + α 预测轨迹长度
         y = log(m + 1)
 
         Args:
+            x: 输入轨迹 (batch, seq_len, 2)
             condition: 起点+终点条件 (batch, 4)
             alpha: 复杂度/风格参数 (batch,) 或 (batch, 1)
+            time: 时间步 (batch,)，默认为 0
 
         Returns:
             log_length: log(m+1) 预测值 (batch, 1)
@@ -446,14 +501,28 @@ class TrajectoryUNet(nn.Module):
         if self.length_head is None:
             raise RuntimeError("Length prediction is not enabled. Set enable_length_prediction=True.")
 
+        batch_size = x.shape[0]
+        device = x.device
+
+        # 默认时间步为 0
+        if time is None:
+            time = torch.zeros(batch_size, device=device)
+
+        # 获取时间嵌入
+        time_emb = self.time_mlp(time)
+
         # 获取条件编码
         cond_emb = self.condition_mlp(condition)  # (batch, time_emb_dim)
+        time_emb = time_emb + cond_emb
 
-        # 获取α编码
+        # 获取α编码 (只用于 length_head，不传入 encoder)
         alpha_emb = self.alpha_embedding(alpha)  # (batch, time_emb_dim)
 
+        # 运行 encoder 获取 bottleneck 特征 (不包含 α，让 encoder 专注于几何特征)
+        encoder_feature = self._encode(x, time_emb)  # (batch, bottleneck_dim)
+
         # 通过长度预测头
-        log_length = self.length_head(cond_emb, alpha_emb)  # (batch, 1)
+        log_length = self.length_head(encoder_feature, cond_emb, alpha_emb)  # (batch, 1)
 
         return log_length
 
@@ -485,7 +554,7 @@ class TrajectoryUNet(nn.Module):
 
 if __name__ == "__main__":
     # 测试模型
-    print("Testing TrajectoryUNet with length prediction...")
+    print("Testing TrajectoryUNet with Shared Encoder length prediction...")
     model = TrajectoryUNet(seq_length=500, input_dim=2, enable_length_prediction=True)
 
     batch_size = 4
@@ -499,11 +568,12 @@ if __name__ == "__main__":
     print(f"Input shape: {x.shape}")
     print(f"Output shape: {output.shape}")
     print(f"Alpha shape: {alpha.shape}")
+    print(f"Bottleneck dim: {model.bottleneck_dim}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # 测试长度预测
-    print("\nTesting length prediction...")
-    log_length = model.predict_length(cond, alpha)
+    # 测试 Shared Encoder 长度预测
+    print("\nTesting Shared Encoder length prediction...")
+    log_length = model.predict_length(x, cond, alpha)
     print(f"Predicted log(m+1): {log_length.squeeze().tolist()}")
 
     # 测试解码

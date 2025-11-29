@@ -178,20 +178,16 @@ class DMTGLoss(nn.Module):
         # 直线距离
         straight_dist = torch.norm(end_points - start_points, dim=-1) + 1e-8  # (batch,)
 
-        # MST 比率
+        # MST 比率 (路径长度 / 直线距离)
         mst_ratio = path_length / straight_dist  # (batch,)
 
-        # 论文 Eq.8-9: 使用 β/(β+1) 公式计算复杂度
-        # β = mst_ratio - 1 (曲线相对于直线的额外长度比)
-        # complexity = β / (β + 1) = (mst_ratio - 1) / mst_ratio
+        # 计算预测复杂度 - 与 compute_trajectory_alpha 保持一致
+        # pred_complexity = (ratio - 1) / 2，clamp 到 [0, 1]
         # ratio=1 (直线) -> complexity=0
-        # ratio→∞ (极复杂) -> complexity→1
-        beta = mst_ratio - 1.0
-        pred_complexity = beta / (beta + 1.0 + 1e-8)
-        pred_complexity = torch.clamp(pred_complexity, 0.0, 1.0)
+        # ratio=3 -> complexity=1
+        pred_complexity = torch.clamp((mst_ratio - 1.0) / 2.0, 0.0, 1.0)
 
-        # Lstyle = ||α - C(p_a)||²
-        # α = 1/(β+1) 是论文的理论复杂度输入
+        # Lstyle = ||α - pred_complexity||² (论文 Eq.13)
         style_loss = F.mse_loss(pred_complexity, alpha)
 
         return style_loss

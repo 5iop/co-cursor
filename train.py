@@ -21,6 +21,8 @@ from pathlib import Path
 from tqdm import tqdm
 import orjson
 from datetime import datetime
+import threading
+import subprocess
 
 # 添加src到路径
 sys.path.insert(0, str(Path(__file__).parent))
@@ -103,6 +105,9 @@ class Trainer:
         lambda_sim: float = 0.1,
         lambda_style: float = 0.05,
         lambda_length: float = 0.1,  # 长度预测损失权重
+        # 自动绘图选项
+        plot: bool = False,
+        human_data_dir: str = None,
     ):
         self.device = device
         self.model = model.to(device)
@@ -160,6 +165,11 @@ class Trainer:
         self.best_loss = float('inf')
         self.train_losses = []
 
+        # 自动绘图选项
+        self.plot = plot
+        self.human_data_dir = human_data_dir
+        self.training_start_time = datetime.now().strftime("%y%m%d%H%M%S")
+
     def train_epoch(self) -> float:
         """训练一个epoch"""
         self.model.train()
@@ -210,7 +220,7 @@ class Trainer:
             predicted_log_length = None
             unet = self.model_raw.model.module if self.distributed else self.model_raw.model
             if hasattr(unet, 'length_head') and unet.length_head is not None:
-                predicted_log_length = unet.predict_length(condition, alpha)
+                predicted_log_length = unet.predict_length(x_t, condition, alpha)
 
             # 使用DMTGLoss计算完整损失 (论文公式14 + 长度预测)
             # L = w1·LDDIM + w2·Lsim + w3·Lstyle + w4·Llength
@@ -299,7 +309,7 @@ class Trainer:
             predicted_log_length = None
             unet = self.model_raw.model.module if self.distributed else self.model_raw.model
             if hasattr(unet, 'length_head') and unet.length_head is not None:
-                predicted_log_length = unet.predict_length(condition, alpha)
+                predicted_log_length = unet.predict_length(x_t, condition, alpha)
 
             # 使用DMTGLoss计算完整损失 (论文公式14 + 长度预测)
             loss_dict = self.loss_fn(
@@ -365,6 +375,69 @@ class Trainer:
         path = self.checkpoint_dir / filename
         torch.save(checkpoint, path)
         print(f"Checkpoint saved to {path}")
+
+    def run_tsne_plot_async(self):
+        """在后台线程运行 t-SNE 分布图和轨迹生成测试 (只在主进程运行)"""
+        if not is_main_process() or not self.plot:
+            return
+
+        # 构建标签：训练开始时间_epoch
+        label = f"{self.training_start_time}_epoch{self.epoch}"
+        checkpoint_path = str(self.checkpoint_dir / "best_model.pt")
+        cwd = str(Path(__file__).parent)
+
+        def _run_tsne():
+            try:
+                cmd = [
+                    sys.executable,
+                    "plot_tsne_distribution.py",
+                    "-c", checkpoint_path,
+                    "-l", label,
+                    "--num_human", "300",
+                    "--num_model", "300",
+                    "--device", "cpu",
+                    "--no_display",
+                ]
+                if self.human_data_dir:
+                    cmd.extend(["--human_data", self.human_data_dir])
+
+                print(f"[t-SNE] Starting background plot: {label}")
+                result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+
+                if result.returncode == 0:
+                    print(f"[t-SNE] Plot completed: {label}")
+                else:
+                    print(f"[t-SNE] Failed: {result.stderr[:200]}")
+            except Exception as e:
+                print(f"[t-SNE] Error: {e}")
+
+        def _run_generate():
+            try:
+                cmd = [
+                    sys.executable,
+                    "test_generate.py",
+                    "--checkpoint", checkpoint_path,
+                    "-l", label,
+                    "--num_samples", "3",
+                    "--device", "cpu",
+                    "--no_display",
+                ]
+
+                print(f"[Generate] Starting background test: {label}")
+                result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+
+                if result.returncode == 0:
+                    print(f"[Generate] Test completed: {label}")
+                else:
+                    print(f"[Generate] Failed: {result.stderr[:200]}")
+            except Exception as e:
+                print(f"[Generate] Error: {e}")
+
+        # 启动两个后台线程
+        thread1 = threading.Thread(target=_run_tsne, daemon=True)
+        thread2 = threading.Thread(target=_run_generate, daemon=True)
+        thread1.start()
+        thread2.start()
 
     def load_checkpoint(self, path: str, total_epochs: int = None):
         """
@@ -453,10 +526,12 @@ class Trainer:
                 if val_loss < self.best_loss:
                     self.best_loss = val_loss
                     self.save_checkpoint("best_model.pt")
+                    self.run_tsne_plot_async()  # 后台运行 t-SNE 绘图
             else:
                 if train_loss < self.best_loss:
                     self.best_loss = train_loss
                     self.save_checkpoint("best_model.pt")
+                    self.run_tsne_plot_async()  # 后台运行 t-SNE 绘图
 
             # 更新学习率
             self.scheduler.step()
@@ -615,6 +690,20 @@ def parse_args():
         default=0.1,
         help="长度预测损失权重 (w4)"
     )
+    parser.add_argument(
+        "--length_mode",
+        type=str,
+        default="shared_encoder",
+        choices=["shared_encoder", "disabled"],
+        help="长度预测模式: shared_encoder (共享Encoder特征), disabled (禁用)"
+    )
+
+    # 自动绘图选项
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="保存 best_model 后自动在后台运行 t-SNE 分布图和轨迹生成测试"
+    )
 
     return parser.parse_args()
 
@@ -729,10 +818,14 @@ def main():
     if is_main_process():
         print("\nCreating model...")
 
+    # Shared Encoder 长度预测模式：使用 U-Net encoder bottleneck 特征
+    enable_length_pred = args.length_mode != "disabled" if hasattr(args, 'length_mode') else True
+
     unet = TrajectoryUNet(
         seq_length=args.max_length,
         input_dim=2,
         base_channels=args.base_channels,
+        enable_length_prediction=enable_length_pred,
     )
 
     model = AlphaDDIM(
@@ -745,6 +838,7 @@ def main():
     if is_main_process():
         num_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {num_params:,}")
+        print(f"Length prediction: {'enabled' if enable_length_pred else 'disabled'}")
 
     # ==================== 创建训练器 ====================
     trainer = Trainer(
@@ -760,6 +854,9 @@ def main():
         lambda_sim=args.lambda_sim,
         lambda_style=args.lambda_style,
         lambda_length=args.lambda_length,
+        # 自动绘图选项
+        plot=args.plot,
+        human_data_dir=boun_path,  # 使用 BOUN 数据作为人类轨迹参考
     )
 
     # 恢复训练
