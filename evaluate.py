@@ -142,7 +142,7 @@ def generate_trajectories(
     generator: TrajectoryGenerator,
     start_points: np.ndarray,
     end_points: np.ndarray,
-    alpha: float = 0.5,
+    alpha: float = 1.5,
     num_samples: int = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """使用模型生成轨迹
@@ -230,7 +230,7 @@ def compare_baselines(
     end_points: np.ndarray,
     dmtg_generator: TrajectoryGenerator,
     num_samples: int = 100,
-    alpha: float = 0.5,
+    alpha: float = 1.5,
     seq_length: int = 500,
 ) -> Tuple[dict, dict, np.ndarray]:
     """与基线方法对比
@@ -322,8 +322,8 @@ def main():
     parser.add_argument(
         "--alpha",
         type=float,
-        default=0.5,
-        help="生成alpha参数"
+        default=1.5,
+        help="生成alpha参数 (path_ratio ∈ [1, +∞), 1=直线, 1.5=默认)"
     )
     parser.add_argument(
         "--output_dir",

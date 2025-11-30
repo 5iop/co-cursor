@@ -172,6 +172,125 @@ def compute_trajectory_metrics(trajectory: np.ndarray) -> dict:
     }
 
 
+def compute_acceleration_directions(trajectory: np.ndarray) -> np.ndarray:
+    """
+    计算轨迹的加速度方向 (论文 Figure 6)
+
+    加速度 = 速度变化 = 二阶差分
+    返回加速度方向角度 (弧度，相对于 x 轴正方向)
+
+    Args:
+        trajectory: 轨迹坐标 (N, 2)
+
+    Returns:
+        加速度方向角度数组 (N-2,)，范围 [-π, π]
+    """
+    if len(trajectory) < 3:
+        return np.array([])
+
+    # 速度 = 一阶差分
+    velocity = np.diff(trajectory, axis=0)  # (N-1, 2)
+
+    # 加速度 = 二阶差分 = 速度的一阶差分
+    acceleration = np.diff(velocity, axis=0)  # (N-2, 2)
+
+    # 计算加速度方向角度
+    angles = np.arctan2(acceleration[:, 1], acceleration[:, 0])  # (N-2,)
+
+    return angles
+
+
+def classify_trajectory_direction(trajectory: np.ndarray) -> str:
+    """
+    判断轨迹是上行还是下行
+
+    Args:
+        trajectory: 轨迹坐标 (N, 2)
+
+    Returns:
+        "up" 或 "down"
+    """
+    dy = trajectory[-1, 1] - trajectory[0, 1]
+    return "up" if dy > 0 else "down"
+
+
+def plot_acceleration_distribution(results: list, save_path: str = None, no_display: bool = False):
+    """
+    绘制加速度方向分布图 (论文 Figure 6 风格)
+
+    对比上行和下行轨迹的加速度方向分布
+    """
+    # 分类轨迹
+    up_angles = []
+    down_angles = []
+
+    for r in results:
+        traj = r['trajectory']
+        direction = classify_trajectory_direction(traj)
+        angles = compute_acceleration_directions(traj)
+
+        if len(angles) > 0:
+            if direction == "up":
+                up_angles.extend(angles)
+            else:
+                down_angles.extend(angles)
+
+    up_angles = np.array(up_angles)
+    down_angles = np.array(down_angles)
+
+    if len(up_angles) == 0 and len(down_angles) == 0:
+        print("警告: 没有足够的数据计算加速度分布")
+        return None
+
+    # 创建极坐标直方图
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), subplot_kw=dict(projection='polar'))
+
+    # 设置 bin 数量
+    n_bins = 36  # 每10度一个bin
+
+    # 上行轨迹
+    ax = axes[0]
+    if len(up_angles) > 0:
+        counts, bin_edges = np.histogram(up_angles, bins=n_bins, range=(-np.pi, np.pi))
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        width = 2 * np.pi / n_bins
+        # 归一化
+        counts_norm = counts / counts.max() if counts.max() > 0 else counts
+        ax.bar(bin_centers, counts_norm, width=width, alpha=0.7, color='blue', edgecolor='darkblue')
+    ax.set_title('上行轨迹 (Upward)\n加速度方向分布', fontsize=12, pad=15)
+    ax.set_theta_zero_location('E')  # 0度在右侧
+    ax.set_theta_direction(-1)  # 顺时针
+
+    # 下行轨迹
+    ax = axes[1]
+    if len(down_angles) > 0:
+        counts, bin_edges = np.histogram(down_angles, bins=n_bins, range=(-np.pi, np.pi))
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        width = 2 * np.pi / n_bins
+        counts_norm = counts / counts.max() if counts.max() > 0 else counts
+        ax.bar(bin_centers, counts_norm, width=width, alpha=0.7, color='red', edgecolor='darkred')
+    ax.set_title('下行轨迹 (Downward)\n加速度方向分布', fontsize=12, pad=15)
+    ax.set_theta_zero_location('E')
+    ax.set_theta_direction(-1)
+
+    # 添加统计信息
+    fig.suptitle(f'加速度方向分布 (论文 Fig.6)\n上行: {len(up_angles)} 点, 下行: {len(down_angles)} 点',
+                 fontsize=14, fontweight='bold')
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"已保存加速度分布图: {save_path}")
+
+    if no_display:
+        plt.close(fig)
+    else:
+        plt.show()
+
+    return fig
+
+
 def generate_trajectories(
     model,
     start_points: list,
@@ -559,6 +678,8 @@ def main():
                        help="Label for this experiment (appended to output filename)")
     parser.add_argument("--no_display", action="store_true",
                        help="Don't display the plot (useful for background execution)")
+    parser.add_argument("--acceleration_dist", action="store_true",
+                       help="Generate acceleration direction distribution plot (Fig.6)")
     args = parser.parse_args()
 
     # 创建输出目录
@@ -585,8 +706,8 @@ def main():
         ((0.2, 0.8), (0.8, 0.2)),  # 反对角线
     ]
 
-    # 不同的 alpha 值
-    alphas = [0.3, 0.5, 0.8]
+    # 不同的 alpha 值 (path_ratio ∈ [1, +∞), α=1 为直线)
+    alphas = [1.0, 1.2, 1.5, 2.0, 2.5, 3.0]
 
     # 生成轨迹
     print(f"\nGenerating trajectories...")
@@ -685,6 +806,21 @@ def main():
         )
 
     print(f"\n图表已保存到 {save_path}")
+
+    # 加速度方向分布图 (论文 Fig.6)
+    if args.acceleration_dist:
+        print("\n正在生成加速度方向分布图...")
+        if args.label:
+            accel_filename = f"acceleration_dist_{args.label}.png"
+        else:
+            accel_filename = f"acceleration_dist_{timestamp}.png"
+        accel_save_path = output_dir / accel_filename
+        plot_acceleration_distribution(
+            all_results,
+            save_path=accel_save_path,
+            no_display=args.no_display
+        )
+
     print("完成!")
 
 

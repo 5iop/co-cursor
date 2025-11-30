@@ -77,7 +77,6 @@ class DMTGLoss(nn.Module):
         total_loss = self.lambda_ddim * ddim_loss
 
         # 2. 辅助损失 (论文 Eq.12-13)
-        # 移除 t < 0.5T 约束，所有时间步都计算辅助损失
         if predicted_x0 is not None and target_x0 is not None:
             # Lsim (公式12): ||p_a - X̂||² - 生成轨迹与人类模板的差距
             sim_loss = self._similarity_loss(predicted_x0, target_x0, mask)
@@ -139,15 +138,18 @@ class DMTGLoss(nn.Module):
         mask: torch.Tensor = None,
     ) -> torch.Tensor:
         """
-        风格损失 (论文 Eq.13 + Eq.8-9)
-        Lstyle := ||α - C(p_a)||²
+        风格损失 (论文 Eq.13)
+        Lstyle := ||α - ratio(p_a)||²
 
-        使用 MST 近似熵作为复杂度度量 (论文 Eq.8-9):
-        C(p_a) = (MST_ratio - 1) / 2, 归一化到 [0, 1]
+        论文方案A:
+        - α 是 path_ratio = path_length / straight_distance
+        - α ∈ [1, +∞)，α=1 表示直线
+        - 直接比较目标 α 和生成轨迹的 ratio
 
-        α: 目标复杂度参数 (batch,) ∈ [0.3, 0.8]
-        C(p_a): 生成轨迹的 MST 复杂度 ∈ [0, 1]
-        mask: 有效位置掩码 (batch, seq_len)
+        Args:
+            predicted: 生成轨迹 (batch, seq_len, 2)
+            alpha: 目标 path_ratio (batch,) ∈ [1, +∞)
+            mask: 有效位置掩码 (batch, seq_len)
         """
         batch_size = predicted.shape[0]
 
@@ -178,20 +180,79 @@ class DMTGLoss(nn.Module):
         # 直线距离
         straight_dist = torch.norm(end_points - start_points, dim=-1) + 1e-8  # (batch,)
 
-        # MST 比率 (路径长度 / 直线距离)
-        mst_ratio = path_length / straight_dist  # (batch,)
+        # 计算生成轨迹的 path_ratio (与 compute_trajectory_alpha 一致)
+        pred_ratio = path_length / straight_dist  # (batch,)
+        pred_ratio = pred_ratio.clamp(min=1.0)  # 确保 >= 1
 
-        # 计算预测复杂度 (论文风格，无 clamp 避免梯度消失)
-        # pred_complexity = (ratio - 1) / ratio = 1 - 1/ratio
-        # ratio=1 (直线) -> complexity=0
-        # ratio=2 -> complexity=0.5
-        # ratio→∞ -> complexity→1 (渐近，梯度 1/ratio² 永不为0)
-        pred_complexity = (mst_ratio - 1.0) / mst_ratio
-
-        # Lstyle = ||α - pred_complexity||² (论文 Eq.13)
-        style_loss = F.mse_loss(pred_complexity, alpha)
+        # Lstyle = ||α - ratio(p_a)||_2 (论文 Eq.13: L2范数，非平方)
+        # 对于标量，L2范数 = 绝对值，使用 L1 loss
+        style_loss = F.l1_loss(pred_ratio, alpha)
 
         return style_loss
+
+    def _similarity_loss_weighted(
+        self,
+        predicted: torch.Tensor,
+        template: torch.Tensor,
+        mask: torch.Tensor = None,
+        aux_mask: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        带时间步权重的相似度损失
+
+        只对 aux_mask=1 的样本计算损失，用于 t < 0.5T 约束
+
+        Args:
+            predicted: 预测轨迹 (batch, seq_len, 2)
+            template: 人类模板轨迹 (batch, seq_len, 2)
+            mask: 有效位置掩码 (batch, seq_len)
+            aux_mask: 辅助损失掩码 (batch,), 1 表示计算损失
+        """
+        if aux_mask is None:
+            return self._similarity_loss(predicted, template, mask)
+
+        # 只选择 aux_mask=1 的样本
+        valid_indices = aux_mask.nonzero(as_tuple=True)[0]
+        if len(valid_indices) == 0:
+            return torch.tensor(0.0, device=predicted.device)
+
+        predicted_filtered = predicted[valid_indices]
+        template_filtered = template[valid_indices]
+        mask_filtered = mask[valid_indices] if mask is not None else None
+
+        return self._similarity_loss(predicted_filtered, template_filtered, mask_filtered)
+
+    def _style_loss_weighted(
+        self,
+        predicted: torch.Tensor,
+        alpha: torch.Tensor,
+        mask: torch.Tensor = None,
+        aux_mask: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        带时间步权重的风格损失
+
+        只对 aux_mask=1 的样本计算损失，用于 t < 0.5T 约束
+
+        Args:
+            predicted: 生成轨迹 (batch, seq_len, 2)
+            alpha: 目标 path_ratio (batch,)
+            mask: 有效位置掩码 (batch, seq_len)
+            aux_mask: 辅助损失掩码 (batch,), 1 表示计算损失
+        """
+        if aux_mask is None:
+            return self._style_loss(predicted, alpha, mask)
+
+        # 只选择 aux_mask=1 的样本
+        valid_indices = aux_mask.nonzero(as_tuple=True)[0]
+        if len(valid_indices) == 0:
+            return torch.tensor(0.0, device=predicted.device)
+
+        predicted_filtered = predicted[valid_indices]
+        alpha_filtered = alpha[valid_indices]
+        mask_filtered = mask[valid_indices] if mask is not None else None
+
+        return self._style_loss(predicted_filtered, alpha_filtered, mask_filtered)
 
     def _length_loss(
         self,
@@ -238,7 +299,7 @@ if __name__ == "__main__":
     target_noise = torch.randn(batch_size, seq_len, 2)
     predicted_x0 = torch.randn(batch_size, seq_len, 2)
     target_x0 = torch.randn(batch_size, seq_len, 2)  # human template
-    alpha = torch.rand(batch_size)  # target complexity
+    alpha = 1.0 + torch.rand(batch_size) * 4.0  # target complexity α ∈ [1, 5]
 
     # 长度预测测试数据
     target_length = torch.randint(10, 500, (batch_size,))  # 真实长度

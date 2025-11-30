@@ -39,7 +39,7 @@ class TestForwardPass:
             x = torch.randn(batch_size, 100, 2, device=device)
             t = torch.randint(0, 100, (batch_size,), device=device)
             cond = torch.randn(batch_size, 4, device=device)
-            alpha = torch.rand(batch_size, device=device)
+            alpha = torch.rand(batch_size, device=device) * 4.0 + 1.0  # [1, 5]
 
             output = unet(x, t, cond, alpha)
             assert output.shape == (batch_size, 100, 2)
@@ -145,8 +145,9 @@ class TestModelProperties:
         assert unet_no_length.length_head is None
 
     def test_alpha_embedding(self, unet, device):
-        """测试 alpha 嵌入"""
-        alpha = torch.rand(4, device=device)
+        """测试 alpha 嵌入 (论文方案A: path_ratio ∈ [1, +∞))"""
+        # α = path_ratio ∈ [1, 5]
+        alpha = torch.rand(4, device=device) * 4.0 + 1.0  # [1, 5]
         alpha_emb = unet.alpha_embedding(alpha)
 
         assert alpha_emb.shape == (4, unet.time_emb_dim)
@@ -179,7 +180,7 @@ class TestNumericalStability:
         x_large = torch.randn(batch_size, 100, 2, device=device) * 100
         t = torch.zeros(batch_size, device=device).long()
         cond = torch.randn(batch_size, 4, device=device)
-        alpha = torch.rand(batch_size, device=device)
+        alpha = torch.rand(batch_size, device=device) * 4.0 + 1.0  # [1, 5]
 
         output = unet(x_large, t, cond, alpha)
         assert not torch.isnan(output).any(), "大值输入产生 NaN"

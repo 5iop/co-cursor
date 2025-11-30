@@ -41,8 +41,8 @@ def main():
     parser.add_argument(
         "--alpha",
         type=float,
-        default=0.5,
-        help="熵控制参数 (0-1, 越大轨迹越复杂)"
+        default=1.5,
+        help="路径复杂度参数 α=path_ratio (≥1.0, α=1为直线, 越大轨迹越复杂)"
     )
     parser.add_argument(
         "--num_samples",
@@ -222,8 +222,8 @@ def generate_demo():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     generator = TrajectoryGenerator(device=device)
 
-    # 生成不同alpha值的轨迹
-    alphas = [0.1, 0.3, 0.5, 0.7, 0.9]
+    # 生成不同alpha值的轨迹 (Paper A: path_ratio >= 1)
+    alphas = [1.0, 1.5, 2.0, 2.5, 3.0]
     trajectories = []
 
     for alpha in alphas:

@@ -89,8 +89,14 @@ def sample_trajectory(batch_size, device):
 
 @pytest.fixture
 def sample_alpha(batch_size, device):
-    """生成样本 alpha 值"""
-    return torch.rand(batch_size, device=device) * 0.5 + 0.3  # [0.3, 0.8]
+    """生成样本 alpha 值 (论文方案A: path_ratio)
+
+    α = path_ratio ∈ [1, +∞)
+    论文实验用 α 经 1/(α+1) 变换后 ∈ [0.3, 0.5]
+    对应 α ∈ [1, ~2.33]
+    这里使用更宽的测试范围 [1, 5]
+    """
+    return torch.rand(batch_size, device=device) * 4.0 + 1.0  # [1.0, 5.0]
 
 
 @pytest.fixture

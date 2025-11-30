@@ -66,7 +66,7 @@ class TrainingConfig:
 class GenerationConfig:
     """生成配置"""
     num_inference_steps: int = 50
-    default_alpha: float = 0.5
+    default_alpha: float = 1.5  # path_ratio ∈ [1, +∞), 1.5 为中等复杂度
     eta: float = 0.0  # DDIM随机性参数
 
 

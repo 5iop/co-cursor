@@ -118,20 +118,24 @@ class AlphaDDIM(nn.Module):
         t: torch.Tensor,
         t_prev: torch.Tensor,
         condition: torch.Tensor,
-        alpha: float = 0.5,  # 熵控制参数 (论文推荐 0-1，采样时约束到 0.3-0.8)
+        alpha: float = 1.5,  # 论文方案A: path_ratio ∈ [1, +∞)
         eta: float = 0.0,  # DDIM随机性参数
     ) -> torch.Tensor:
         """
         α-DDIM单步采样 (论文 Eq.4-6)
 
         核心创新: 双协方差混合
-        Σ = (1-α)·Σ_d + α·Σ_n
+        Σ = (1-α')·Σ_d + α'·Σ_n
+
+        其中 α' = 1 - 1/α 将 Paper A 的 α ∈ [1, +∞) 转换为 [0, 1):
+        - α = 1 (直线) → α' = 0 → 100% 方向噪声
+        - α → ∞ (复杂) → α' → 1 → 100% 各向同性噪声
 
         论文 Eq.4: Σ_d = k_c · ||d|| · (d̂ ⊗ d̂)  -- 方向协方差 (秩1矩阵)
         论文 Eq.5: Σ_n = σ²_n · I              -- 各向同性协方差
-        论文 Eq.6: Σ = (1-α)·Σ_d + α·Σ_n      -- 混合协方差
+        论文 Eq.6: Σ = (1-α')·Σ_d + α'·Σ_n    -- 混合协方差
 
-        采样: z ~ N(0, Σ) ≈ √(1-α)·z_d + √α·z_n
+        采样: z ~ N(0, Σ) ≈ √(1-α')·z_d + √α'·z_n
         其中 z_d ~ N(0, Σ_d), z_n ~ N(0, Σ_n)
 
         Args:
@@ -139,7 +143,7 @@ class AlphaDDIM(nn.Module):
             t: 当前时间步
             t_prev: 上一个时间步
             condition: 条件（起点+终点）(batch, 4)
-            alpha: 熵控制参数 (0-1, 越大越复杂)
+            alpha: Paper A path_ratio (α ≥ 1, 越大越复杂)
             eta: DDIM随机性参数
         """
         batch_size = x_t.shape[0]
@@ -189,16 +193,22 @@ class AlphaDDIM(nn.Module):
         sigma_d = (kc * direction_norm).unsqueeze(1)  # (batch, 1, 1)
         z_d = sigma_d * noise_scalar * direction_unit_expanded  # (batch, seq, 2)
 
-        # 论文 Eq.5: z_n ~ N(0, Σ_n) 其中 Σ_n = σ²_n·I
-        # 各向同性协方差，σ_n = 1 (标准各向同性噪声)
-        z_n = torch.randn_like(x_t)  # (batch, seq, 2)
+        # 论文 Eq.4: z_ε ~ N(0, Σ_ε) 其中 Σ_ε = (k_c·||d||)²·I
+        # 各向同性协方差，但标准差 σ_ε = k_c·||d|| (不是1!)
+        sigma_epsilon = (kc * direction_norm).unsqueeze(1)  # (batch, 1, 1)
+        z_n = sigma_epsilon * torch.randn_like(x_t)  # (batch, seq, 2), cov = (k_c·||d||)²·I
 
         # 论文 Eq.6: 混合协方差采样
-        # z ~ N(0, (1-α)Σ_d + αΣ_n) ≈ √(1-α)·z_d + √α·z_n
-        # 这是因为独立高斯变量的和的方差等于方差的和
-        sqrt_one_minus_alpha = np.sqrt(1 - alpha)
-        sqrt_alpha = np.sqrt(alpha)
-        z_mixed = sqrt_one_minus_alpha * z_d + sqrt_alpha * z_n
+        # 将 α ∈ [1, +∞) 转换为混合系数 a ∈ [0, 1)
+        # a = 1 - 1/α: α=1 → a=0 (全方向), α→∞ → a→1 (全各向同性)
+        # 注意: 这与 StyleEmb 的 α'=1/(α+1) 不同，两者用途不同
+        mixing_coef = 1.0 - 1.0 / max(alpha, 1.0)
+        mixing_coef = min(mixing_coef, 0.99)  # 防止完全各向同性
+
+        # z ~ N(0, (1-a)Σ_d + a·Σ_ε) ≈ √(1-a)·z_d + √a·z_n
+        sqrt_dir = np.sqrt(1 - mixing_coef)    # 方向噪声权重
+        sqrt_iso = np.sqrt(mixing_coef)        # 各向同性噪声权重
+        z_mixed = sqrt_dir * z_d + sqrt_iso * z_n
 
         # 应用总噪声: σ_t 来自 DDIM，z_mixed 来自混合协方差
         sigma_t = sigma_base
@@ -215,7 +225,7 @@ class AlphaDDIM(nn.Module):
         batch_size: int,
         condition: torch.Tensor,
         num_inference_steps: int = 50,
-        alpha: float = 0.5,
+        alpha: float = 1.5,
         eta: float = 0.5,  # 默认启用随机性以支持双协方差混合
         device: str = "cuda",
         effective_length=None,  # 有效轨迹长度 m，支持 int 或 Tensor (batch,)
@@ -234,7 +244,7 @@ class AlphaDDIM(nn.Module):
             batch_size: 批次大小
             condition: 条件张量 (batch, 4) - [start_x, start_y, end_x, end_y]
             num_inference_steps: 最大推理步数
-            alpha: 目标复杂度 (0-1，采样时约束到 0.3-0.8)
+            alpha: 论文方案A path_ratio (α ≥ 1, α=1 直线, α→∞ 复杂)
             eta: DDIM随机性参数
             device: 设备
             effective_length: 有效轨迹长度，支持:
@@ -251,10 +261,10 @@ class AlphaDDIM(nn.Module):
         """
         self.model.eval()
 
-        # 论文 Eq.10: α ∈ [0, 1] 全范围支持
-        # α = 0: 简单直线轨迹
-        # α = 1: 最复杂曲线轨迹
-        alpha_clamped = max(0.0, min(1.0, alpha))
+        # 论文方案A: α = path_ratio ∈ [1, +∞)
+        # α = 1: 直线轨迹（最简单）
+        # α → ∞: 复杂曲线轨迹
+        alpha_clamped = max(1.0, alpha)  # 确保 α >= 1
 
         # 自动长度预测 (Shared Encoder 模式)
         # 如果 auto_length=True 且 effective_length 未指定，则使用模型预测长度
@@ -293,9 +303,12 @@ class AlphaDDIM(nn.Module):
         timesteps = list(range(0, self.timesteps, step_size))[::-1]
 
         # 论文 Eq.8-9: 熵控制器 (使用完整 MST 熵公式)
+        # 将 Paper A 的 α ∈ [1, +∞) 转换为 complexity ∈ [0, 1)
+        # complexity = 1 - 1/α: α=1 → 0, α=2 → 0.5, α→∞ → 1
+        target_complexity = 1.0 - 1.0 / alpha_clamped
         entropy_controller = EntropyController(
-            target_complexity=alpha_clamped,
-            complexity_tolerance=0.05,
+            target_complexity=target_complexity,
+            complexity_tolerance=0.05,  # 保持原值，防止 loss 爆炸
             min_steps=max(5, num_inference_steps // 4),
             use_full_entropy=True,  # 使用完整 MST 熵公式
         )
@@ -366,17 +379,13 @@ class AlphaDDIM(nn.Module):
         effective_length=None,  # 有效轨迹长度 m，支持 int 或 Tensor (batch,)
     ) -> torch.Tensor:
         """
-        按论文 Eq.(2-3) 初始化: X_R = M ⊙ X_c + (1-M) ⊙ ε
+        按论文 Eq.(2-3) 初始化:
+        X_R = {p_0} ∥ {p_c + ε_i}^m ∥ {p_m} ∥ {0}^(N-m)
 
-        论文中的掩码初始化:
-        - M: 掩码矩阵，边界点为1，中间点为0
-        - X_c: 条件点 (起点和终点)
-        - ε: 高斯噪声，标准差按起终点距离缩放 (论文 Eq.3)
+        论文 Eq.2: ε ~ N(0, Σ_ε)，其中 Σ_ε = (k_c · ||p_m - p_0||)²
+        论文 Eq.3: 中间点初始化为 p_c + ε，其中 p_c 是起终点的中点
 
-        论文 Eq.3: σ_ε = k_c · ||p_m - p_0|| / √(m-1)
-        其中 k_c ≈ 1/6 (论文推荐值)
-
-        最终结果: 边界点固定为条件值，中间点为距离缩放的噪声
+        k_c = 1/6 (使99%的点在屏幕内)
 
         Args:
             effective_length: 有效轨迹长度，支持:
@@ -387,31 +396,27 @@ class AlphaDDIM(nn.Module):
         start_point = condition[:, :2]  # (batch, 2)
         end_point = condition[:, 2:]    # (batch, 2)
 
-        # 计算起终点距离 (论文 Eq.3)
+        # 计算起终点距离 (论文 Eq.2)
         distance = torch.norm(end_point - start_point, dim=-1, keepdim=True)  # (batch, 1)
+
+        # 计算起终点中点 (论文 Eq.3)
+        midpoint = (start_point + end_point) / 2  # (batch, 2)
 
         # 处理 effective_length 的不同类型
         is_per_sample = isinstance(effective_length, torch.Tensor)
 
         if is_per_sample:
             # Per-sample 长度: Tensor (batch,)
-            # 注意: 调用者 (sample()) 已经确保 effective_length >= 2
             lengths = effective_length.long().to(device)
-            m_float = lengths.float().unsqueeze(1)  # (batch, 1) for sigma calculation
         elif effective_length is not None:
-            # 统一 int 长度
-            # 注意: 调用者 (sample()) 已经确保 effective_length >= 2
-            m_float = torch.full((batch_size, 1), float(effective_length), device=device)
             lengths = None
         else:
-            # 默认使用 seq_length
-            m_float = torch.full((batch_size, 1), float(self.seq_length), device=device)
             lengths = None
 
-        # σ_ε = k_c · ||d|| / √(m-1)，其中 k_c = 1/6
-        # 除以 √(m-1) 是为了让每个点的噪声累积后保持合理的总体方差
+        # 论文 Eq.2: σ_ε = k_c · ||d||，其中 k_c = 1/6
+        # 不除以 √(m-1)，按论文原始公式
         k_c = 1.0 / 6.0
-        sigma_epsilon = k_c * distance / torch.sqrt(m_float - 1 + 1e-8)  # (batch, 1)
+        sigma_epsilon = k_c * distance  # (batch, 1)
         sigma_epsilon = sigma_epsilon.unsqueeze(2)  # (batch, 1, 1) for broadcasting
 
         # 创建掩码 M (论文 Eq.2)
@@ -445,9 +450,9 @@ class AlphaDDIM(nn.Module):
         noise = torch.randn(batch_size, self.seq_length, self.input_dim, device=device)
         scaled_noise = noise * sigma_epsilon  # (batch, seq_len, 2)
 
-        # 中间点初始化为缩放噪声
-        # 注: 论文 Eq.3 建议使用 p_c + ε (中点 + 噪声)，但实测效果不佳，详见 CAUTION.md
-        middle_points = scaled_noise  # (batch, seq_len, 2)
+        # 论文 Eq.3: 中间点初始化为 p_c + ε (中点 + 噪声)
+        midpoint_expanded = midpoint.unsqueeze(1).expand(-1, self.seq_length, -1)  # (batch, seq_len, 2)
+        middle_points = midpoint_expanded + scaled_noise  # (batch, seq_len, 2)
 
         # 创建 padding mask (有效部分为1，padding部分为0)
         if is_per_sample:
@@ -461,7 +466,7 @@ class AlphaDDIM(nn.Module):
             middle_points = middle_points * padding_mask
 
         # 使用 mask 组合边界点和中间点
-        # X_R = {p_0} ∥ {ε} ∥ {p_m} ∥ {0}
+        # X_R = {p_0} ∥ {p_c + ε} ∥ {p_m} ∥ {0}
         x = mask * x_c + (1 - mask) * middle_points
 
         return x
@@ -543,15 +548,17 @@ class AlphaDDIM(nn.Module):
         Args:
             batch_size: 批次大小
             condition: 条件张量
-            target_complexity: 目标复杂度 (论文推荐 0.3-0.8)
+            target_complexity: 目标复杂度 ∈ [0, 1)
+                - 0: 直线（最简单）
+                - → 1: 复杂曲线
             max_attempts: 最大尝试次数
             device: 设备
 
         Returns:
             (trajectories, info_dict)
         """
-        # 约束到论文推荐范围
-        target_complexity = max(0.3, min(0.8, target_complexity))
+        # 约束复杂度到 [0, 0.9]，避免极端值
+        target_complexity = max(0.0, min(0.9, target_complexity))
 
         entropy_controller = EntropyController(
             target_complexity=target_complexity,
@@ -563,10 +570,13 @@ class AlphaDDIM(nn.Module):
         info = {'attempts': 0, 'final_complexity': 0}
 
         for attempt in range(max_attempts):
-            # α 直接作为目标复杂度 (论文设计)
-            # 每次尝试略微调整
-            alpha = target_complexity * (1 + 0.05 * (attempt - 1))
-            alpha = max(0.3, min(0.8, alpha))
+            # 将 complexity ∈ [0, 1) 转换为 α = path_ratio ∈ [1, +∞)
+            # complexity = 1 - 1/α → α = 1 / (1 - complexity)
+            # complexity=0 → α=1, complexity=0.5 → α=2, complexity→1 → α→∞
+            adjusted_complexity = target_complexity * (1 + 0.05 * (attempt - 1))
+            adjusted_complexity = max(0.0, min(0.95, adjusted_complexity))
+            alpha = 1.0 / (1.0 - adjusted_complexity + 1e-8)
+            alpha = max(1.0, min(10.0, alpha))  # 限制到合理范围
 
             # 使用新的 sample 函数 (内置熵控制)
             trajectories = self.sample(
@@ -599,7 +609,7 @@ class AlphaDDIM(nn.Module):
         self,
         batch_size: int,
         condition: torch.Tensor,
-        alpha: float = 0.5,
+        alpha: float = 1.5,
         num_inference_steps: int = 50,
         eta: float = 0.5,
         device: str = "cuda",
@@ -614,7 +624,7 @@ class AlphaDDIM(nn.Module):
         Args:
             batch_size: 批次大小
             condition: 条件张量 (batch, 4) - [start_x, start_y, end_x, end_y]
-            alpha: 目标复杂度 (0-1)
+            alpha: path_ratio (α ≥ 1, α=1 直线, α→∞ 复杂)
             num_inference_steps: 推理步数
             eta: DDIM随机性参数
             device: 设备
@@ -634,8 +644,8 @@ class AlphaDDIM(nn.Module):
 
         self.model.eval()
 
-        # 约束 alpha
-        alpha_clamped = max(0.0, min(1.0, alpha))
+        # 约束 alpha (path_ratio 语义: α ≥ 1)
+        alpha_clamped = max(1.0, alpha)
 
         # 预测长度 (Shared Encoder 模式)
         alpha_tensor = torch.full((batch_size,), alpha_clamped, device=device, dtype=torch.float32)
@@ -850,17 +860,21 @@ class AlphaDDIM(nn.Module):
         mask: torch.Tensor = None
     ) -> torch.Tensor:
         """
-        从轨迹计算复杂度参数α
+        从轨迹计算复杂度参数α (论文方案A)
 
-        基于路径长度比率 (论文Eq.13中的复杂度定义)
-        α = (path_length / straight_distance - 1) / max_ratio
+        α = path_length / straight_distance (ratio)
+
+        论文语义:
+        - α = 1: 直线轨迹（最简单）
+        - α → ∞: 复杂曲线轨迹
+        - 论文推荐范围: α ∈ [1, ~10]，实验用 [0.3, 0.8] 经 1/(α+1) 变换后
 
         Args:
             trajectory: (batch, seq_len, 2)
             mask: (batch, seq_len) 有效位置掩码，1表示有效，0表示padding
 
         Returns:
-            alpha: (batch,) 范围 [0, 1]
+            alpha: (batch,) 范围 [1, +∞)，即 path_ratio
         """
         batch_size = trajectory.shape[0]
         device = trajectory.device
@@ -900,13 +914,11 @@ class AlphaDDIM(nn.Module):
             # 计算直线距离
             straight_dist = torch.norm(end_points - start_points, dim=-1) + 1e-8  # (batch,)
 
-        # 路径长度比率
-        ratio = path_length / straight_dist
-
-        # 归一化到 [0, 1]
-        # ratio=1 表示直线 -> alpha=0
-        # ratio=3 表示复杂曲线 -> alpha=1
-        alpha = torch.clamp((ratio - 1.0) / 2.0, 0.0, 1.0)
+        # 路径长度比率 (论文中的 α)
+        # α = path_length / straight_dist
+        # α >= 1，α=1 表示直线
+        alpha = path_length / straight_dist
+        alpha = alpha.clamp(min=1.0)  # 确保 >= 1
 
         return alpha
 
@@ -964,32 +976,36 @@ class EntropyController:
 
     def compute_mst_entropy(self, trajectory: torch.Tensor) -> torch.Tensor:
         """
-        计算完整的 MST 熵 (论文 Eq.8-9)
+        计算 MST 熵 (论文 Eq.8-9)
 
-        H(X) ≈ (d/m) * Σ log(m * L_i) + log(c_d) + C_E
+        论文推导:
+        - Eq.8: L_MST ≃ Σ||p_i - p_{i+1}||_2 (路径总长度)
+        - Eq.9: log(E(L_MST)) ≃ log(β) + ½·log(m) + ½·log(|Σ|)
+                             = H({p_a}) + log(β) + ½·log(m) - log(2πe)
+
+        因此: H ≈ log(L_path) - ½·log(m) + C
+        其中 C = log(2πe) - log(β) 是常数
 
         Args:
             trajectory: (batch, seq_len, 2)
 
         Returns:
-            entropy: (batch,) MST 熵值
+            entropy: (batch,) MST 熵估计值
         """
         batch_size, seq_len, d = trajectory.shape
-        m = seq_len  # 点数
+        m = float(seq_len)
 
-        # 计算相邻点距离 (近似 MST 边长)
+        # Eq.8: 计算路径总长度 L_path = Σ||p_i - p_{i+1}||
         segments = trajectory[:, 1:, :] - trajectory[:, :-1, :]
-        edge_lengths = torch.norm(segments, dim=-1)  # (batch, seq_len-1)
+        path_length = torch.norm(segments, dim=-1).sum(dim=-1)  # (batch,)
 
         # 避免 log(0)
-        edge_lengths = edge_lengths.clamp(min=1e-8)
+        path_length = path_length.clamp(min=1e-8)
 
-        # 论文 Eq.8: H(X) ≈ (d/m) * Σ log(m * L_i) + log(c_d) + C_E
-        # 注意: 这里 m-1 条边
-        log_term = torch.log(m * edge_lengths)  # (batch, seq_len-1)
-        sum_log = log_term.sum(dim=-1)  # (batch,)
-
-        entropy = (d / m) * sum_log + np.log(self.C_2D) + self.EULER_CONSTANT
+        # Eq.9: H ≈ log(L_path) - ½·log(m) + log(2πe)
+        # log(2πe) ≈ 2.837
+        LOG_2PI_E = np.log(2 * np.pi * np.e)  # ≈ 2.837
+        entropy = torch.log(path_length) - 0.5 * np.log(m) + LOG_2PI_E
 
         return entropy
 
@@ -1073,10 +1089,24 @@ class EntropyController:
 
     def get_alpha_from_complexity(self, target_complexity: float) -> float:
         """
-        根据目标复杂度获取alpha值
+        根据目标复杂度获取 alpha (path_ratio) 值
+
+        将 complexity ∈ [0, 1) 转换为 α = path_ratio ∈ [1, +∞)
+        complexity = 1 - 1/α → α = 1 / (1 - complexity)
+
+        Args:
+            target_complexity: 目标复杂度 ∈ [0, 1)
+                - 0: 直线（最简单）
+                - → 1: 复杂曲线
+
+        Returns:
+            alpha: path_ratio ≥ 1
         """
-        # 非线性映射：低复杂度需要低alpha，高复杂度需要高alpha
-        return 0.1 + 0.9 * (target_complexity ** 0.5)
+        # 限制复杂度范围
+        target_complexity = max(0.0, min(0.95, target_complexity))
+        # complexity = 1 - 1/α → α = 1 / (1 - complexity)
+        alpha = 1.0 / (1.0 - target_complexity + 1e-8)
+        return max(1.0, min(10.0, alpha))  # 限制到合理范围
 
 
 def create_alpha_ddim(
@@ -1123,7 +1153,7 @@ if __name__ == "__main__":
         batch_size=2,
         condition=condition[:2],
         num_inference_steps=20,
-        alpha=0.5,
+        alpha=1.5,
         device=device
     )
     print(f"Generated trajectory shape: {samples.shape}")

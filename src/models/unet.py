@@ -30,8 +30,18 @@ class DiscreteAlphaEmbedding(nn.Module):
     """
     离散α风格嵌入 (论文 Eq.10)
 
-    将连续的α值离散化为S个bin，使用位置编码嵌入
-    论文中α = 1/(β+1)，β是理论复杂度
+    StyleEmb(α) = PosEmb(⌊α'·S⌋)
+    s.t. α' = 1/(α+1)
+
+    论文语义:
+    - α ∈ [0, +∞) 是复杂度参数
+    - α' = 1/(α+1) 将 α 映射到 (0, 1]
+    - α=0 → α'=1 (最简单), α→∞ → α'→0 (最复杂)
+    - bin = floor(α' * S)
+
+    注意: 训练时 α = path_ratio ∈ [1, +∞)
+    - α=1 → α'=0.5, bin=floor(0.5*S)=S/2
+    - α=10 → α'≈0.09, bin=floor(0.09*S)≈0
     """
 
     def __init__(self, num_bins: int = 10, embedding_dim: int = 128):
@@ -39,8 +49,8 @@ class DiscreteAlphaEmbedding(nn.Module):
         self.num_bins = num_bins
         self.embedding_dim = embedding_dim
 
-        # 离散bin的嵌入表
-        self.embedding = nn.Embedding(num_bins, embedding_dim)
+        # 使用正弦位置编码 (论文 Eq.10: PosEmb)
+        self.pos_emb = SinusoidalPositionEmbeddings(embedding_dim)
 
         # 投影层
         self.proj = nn.Sequential(
@@ -52,22 +62,28 @@ class DiscreteAlphaEmbedding(nn.Module):
     def forward(self, alpha: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            alpha: 连续α值 (batch,) 或 (batch, 1)，范围 [0, 1]
-                   (代码中 α 已通过 compute_trajectory_alpha 归一化到 [0, 1])
+            alpha: path_ratio 值 (batch,) 或 (batch, 1)，范围 [1, +∞)
+                   α = path_length / straight_distance
         Returns:
             嵌入向量 (batch, embedding_dim)
         """
         if alpha.dim() == 2:
             alpha = alpha.squeeze(-1)
 
-        # 将α离散化为bin索引
-        # α ∈ [0, 1] -> bin ∈ [0, num_bins-1]
-        # 注：论文 Eq.10 的 α'=1/(α+1) 变换适用于原始 α∈[0,+∞)
-        #     但代码中 α 已归一化到 [0,1]，故不需要此变换
-        bin_idx = (alpha * (self.num_bins - 1)).long().clamp(0, self.num_bins - 1)
+        # 论文 Eq.10: α' = 1/(α+1), 其中论文的 α ∈ [0, +∞)
+        # 代码使用 path_ratio ∈ [1, +∞), 对应关系: paper_α = path_ratio - 1
+        # 因此: α' = 1/((path_ratio-1)+1) = 1/path_ratio
+        # path_ratio=1 → α'=1 (直线), path_ratio→∞ → α'→0 (复杂)
+        alpha_prime = 1.0 / alpha.clamp(min=1.0)
 
-        # 获取嵌入
-        emb = self.embedding(bin_idx)
+        # 论文 Eq.10: bin = floor(α' * S)
+        # α'=1 → bin=S-1 (最简单), α'→0 → bin=0 (最复杂)
+        bin_idx = torch.floor(alpha_prime * self.num_bins).long()
+        bin_idx = bin_idx.clamp(0, self.num_bins - 1)
+
+        # 使用正弦位置编码 (论文: PosEmb)
+        # 将 bin_idx 作为 "position" 输入
+        emb = self.pos_emb(bin_idx.float())
 
         # 投影
         return self.proj(emb)
@@ -394,6 +410,10 @@ class TrajectoryUNet(nn.Module):
         """
         前向传播 - 论文公式10: ε_θ(x_t, t, c, α)
 
+        论文 Figure 3 描述:
+        - Encoder: 仅由时间步 t 控制
+        - Decoder: 由时间步 t 和复杂度系数 α 共同控制
+
         Args:
             x: 噪声轨迹 (batch, seq_len, 2)
             time: 时间步 (batch,)
@@ -403,37 +423,42 @@ class TrajectoryUNet(nn.Module):
         # 转换为 (batch, channels, seq_len)
         x = x.transpose(1, 2)
 
-        # 时间嵌入
+        # 时间嵌入 (用于 encoder 和 decoder)
         time_emb = self.time_mlp(time)
 
-        # 条件嵌入
+        # 条件嵌入 (起点+终点，用于 encoder 和 decoder)
         if condition is not None:
             cond_emb = self.condition_mlp(condition)
             time_emb = time_emb + cond_emb
 
-        # α 嵌入 - 论文Eq.10: 离散bin嵌入
+        # Encoder 使用的嵌入: 仅 t + condition (论文: encoder solely controlled by t)
+        encoder_emb = time_emb
+
+        # Decoder 使用的嵌入: t + condition + α (论文: decoder influenced by t and α)
         if alpha is not None:
             alpha_emb = self.alpha_embedding(alpha)
-            time_emb = time_emb + alpha_emb
+            decoder_emb = time_emb + alpha_emb
+        else:
+            decoder_emb = time_emb
 
         # 输入投影
         h = self.input_proj(x)
 
-        # 下采样
+        # 下采样 (Encoder) - 仅使用 t，不使用 α
         skips = []
         for down_block in self.down_blocks:
-            h, skip = down_block(h, time_emb)
+            h, skip = down_block(h, encoder_emb)
             skips.append(skip)
 
-        # 中间处理
-        h = self.mid_block1(h, time_emb)
+        # 中间处理 - 使用 decoder_emb (包含 α)
+        h = self.mid_block1(h, decoder_emb)
         h = self.mid_attention(h)
-        h = self.mid_block2(h, time_emb)
+        h = self.mid_block2(h, decoder_emb)
 
-        # 上采样
+        # 上采样 (Decoder) - 使用 t + α
         for up_block in self.up_blocks:
             skip = skips.pop()
-            h = up_block(h, skip, time_emb)
+            h = up_block(h, skip, decoder_emb)
 
         # 输出
         h = self.output_proj(h)
@@ -561,13 +586,15 @@ if __name__ == "__main__":
     x = torch.randn(batch_size, 500, 2)
     t = torch.randint(0, 1000, (batch_size,))
     cond = torch.randn(batch_size, 4)
-    alpha = torch.rand(batch_size)  # 复杂度参数 [0, 1]
+    # 复杂度参数 α = path_ratio ∈ [1, +∞)
+    # α=1 表示直线，α>1 表示曲线
+    alpha = 1.0 + torch.rand(batch_size) * 4.0  # [1, 5] 范围
 
     # 测试论文公式10: ε_θ(x_t, t, c, α)
     output = model(x, t, cond, alpha)
     print(f"Input shape: {x.shape}")
     print(f"Output shape: {output.shape}")
-    print(f"Alpha shape: {alpha.shape}")
+    print(f"Alpha values: {alpha.tolist()}")
     print(f"Bottleneck dim: {model.bottleneck_dim}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 

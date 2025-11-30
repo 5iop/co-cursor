@@ -63,8 +63,8 @@ def compute_loss_distribution(n_batches: int = 100, batch_size: int = 32, seq_le
         predicted_noise = torch.randn(batch_size, seq_len, 2)
         target_noise = torch.randn(batch_size, seq_len, 2)
 
-        # 生成随机alpha（论文推荐范围 [0.3, 0.8]）
-        alpha = 0.3 + 0.5 * torch.rand(batch_size)
+        # 生成随机alpha（path_ratio ∈ [1, 5]）
+        alpha = 1.0 + 4.0 * torch.rand(batch_size)
 
         # 计算损失
         losses = loss_fn(predicted_noise, target_noise, predicted_x0, target_x0, alpha=alpha)
@@ -201,10 +201,10 @@ def plot_loss_vs_complexity(save_path: str = None):
             predicted.append(np.stack([x, y], axis=-1))
         predicted_x0 = torch.FloatTensor(np.array(predicted))
 
-        # 计算损失（使用固定alpha=0.5作为目标复杂度）
+        # 计算损失（使用固定alpha=1.5作为目标复杂度）
         noise_p = torch.randn(batch_size, seq_len, 2)
         noise_t = torch.randn(batch_size, seq_len, 2)
-        alpha = torch.full((batch_size,), 0.5)  # 固定目标复杂度
+        alpha = torch.full((batch_size,), 1.5)  # 固定目标复杂度 (path_ratio)
         losses = loss_fn(noise_p, noise_t, predicted_x0, target_x0, alpha=alpha)
 
         style_losses.append(losses['style_loss'].item())

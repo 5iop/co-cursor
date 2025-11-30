@@ -69,8 +69,8 @@ def target_x0(batch_size, seq_len):
 
 @pytest.fixture
 def alpha(batch_size):
-    """生成目标复杂度 alpha"""
-    return torch.rand(batch_size) * 0.5 + 0.3  # [0.3, 0.8]
+    """生成目标复杂度 alpha (论文方案A: path_ratio ∈ [1, +∞))"""
+    return torch.rand(batch_size) * 4.0 + 1.0  # [1.0, 5.0]
 
 
 @pytest.fixture
@@ -232,13 +232,13 @@ class TestLStyle:
         assert result['style_loss'] >= 0
 
     def test_style_loss_straight_line(self, loss_fn, predicted_noise, target_noise, batch_size, seq_len):
-        """测试直线轨迹的复杂度应接近 0"""
+        """测试直线轨迹的复杂度应接近 1 (论文方案A: α = path_ratio)"""
         # 创建直线轨迹: 从 (0, 0) 到 (1, 1)
         t = torch.linspace(0, 1, seq_len).unsqueeze(0).expand(batch_size, -1)
         straight_traj = torch.stack([t, t], dim=-1)  # (batch, seq, 2)
 
-        # alpha = 0 表示期望简单轨迹
-        alpha = torch.zeros(batch_size)
+        # alpha = 1 表示直线轨迹 (path_ratio = 1)
+        alpha = torch.ones(batch_size)
 
         result = loss_fn(
             predicted_noise, target_noise,
@@ -247,11 +247,11 @@ class TestLStyle:
             alpha=alpha,
         )
 
-        # 直线轨迹的复杂度接近 0，与 alpha=0 匹配，损失应该很小
+        # 直线轨迹的 path_ratio ≈ 1，与 alpha=1 匹配，损失应该很小
         assert result['style_loss'].item() < 0.1
 
     def test_style_loss_complex_trajectory(self, loss_fn, predicted_noise, target_noise, batch_size, seq_len):
-        """测试复杂轨迹的复杂度应更高"""
+        """测试复杂轨迹的复杂度应更高 (论文方案A: α = path_ratio)"""
         # 创建曲折轨迹
         t = torch.linspace(0, 1, seq_len)
         # 正弦波路径
@@ -259,8 +259,8 @@ class TestLStyle:
         y = torch.sin(t * 4 * 3.14159)  # 两个完整周期
         complex_traj = torch.stack([x, y], dim=-1).unsqueeze(0).expand(batch_size, -1, -1)
 
-        # alpha = 0.8 表示期望复杂轨迹
-        alpha = torch.full((batch_size,), 0.8)
+        # alpha = 3.0 表示期望复杂轨迹 (path_ratio = 3)
+        alpha = torch.full((batch_size,), 3.0)
 
         result = loss_fn(
             predicted_noise, target_noise,
@@ -286,11 +286,11 @@ class TestLStyle:
         assert result['style_loss'] >= 0
 
     def test_style_loss_complexity_formula(self, batch_size, seq_len):
-        """测试复杂度公式: C = (ratio - 1) / 2，与 compute_trajectory_alpha 一致"""
+        """测试 path_ratio 公式 (论文方案A): α = path_length / straight_distance"""
         # 创建简单轨迹用于验证公式
         loss_fn = DMTGLoss()
 
-        # 直线: mst_ratio = 1, complexity = 0
+        # 直线: path_ratio = 1
         t = torch.linspace(0, 1, seq_len).unsqueeze(0).expand(batch_size, -1)
         straight = torch.stack([t, t], dim=-1)
 
@@ -298,12 +298,10 @@ class TestLStyle:
         segments = straight[:, 1:, :] - straight[:, :-1, :]
         path_length = torch.norm(segments, dim=-1).sum(dim=-1)
         straight_dist = torch.norm(straight[:, -1, :] - straight[:, 0, :], dim=-1)
-        mst_ratio = path_length / (straight_dist + 1e-8)
-        # 新公式: complexity = (ratio - 1) / 2
-        complexity = torch.clamp((mst_ratio - 1.0) / 2.0, 0.0, 1.0)
+        path_ratio = path_length / (straight_dist + 1e-8)
 
-        # 直线的 complexity 应接近 0
-        assert complexity.mean().item() < 0.1
+        # 直线的 path_ratio 应接近 1
+        assert (path_ratio - 1.0).abs().mean().item() < 0.1
 
     def test_style_loss_weight(self, predicted_noise, target_noise, predicted_x0, target_x0, alpha):
         """测试 lambda_style 权重"""

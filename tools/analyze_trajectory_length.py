@@ -19,16 +19,16 @@ DISTANCE_THRESHOLD = 100.0  # SapiMouse 轨迹分割阈值
 
 def compute_complexity(coords: np.ndarray) -> float:
     """
-    计算轨迹复杂度
+    计算轨迹复杂度（论文方案A: 直接使用 path_ratio）
 
     Args:
         coords: (N, 2) 轨迹坐标
 
     Returns:
-        complexity: 复杂度值 [0, 1)
+        complexity: path_ratio 值 [1, +∞)，1 表示直线
     """
     if len(coords) < 2:
-        return 0.0
+        return 1.0
 
     # 计算路径长度
     segments = coords[1:] - coords[:-1]
@@ -38,16 +38,14 @@ def compute_complexity(coords: np.ndarray) -> float:
     straight_dist = np.linalg.norm(coords[-1] - coords[0])
 
     if straight_dist < 1e-8:
-        # 起终点重合，使用路径长度作为复杂度指标
-        return min(path_length, 1.0)
+        # 起终点重合，返回大值表示复杂
+        return max(path_length, 1.0)
 
     # path_ratio = path_length / straight_dist
+    # 论文中 α = path_ratio，α=1 表示直线，α 越大越复杂
     path_ratio = path_length / straight_dist
 
-    # complexity = (ratio - 1) / ratio = 1 - 1/ratio
-    complexity = (path_ratio - 1.0) / path_ratio
-
-    return complexity
+    return max(path_ratio, 1.0)
 
 
 def analyze_parquet_file(file_path: Path) -> tuple:
@@ -179,41 +177,44 @@ def print_complexity_distribution(complexities: list, dataset_name: str):
 
     comp = np.array(complexities)
 
-    print(f"\n--- 复杂度分布 (complexity = 1 - 1/ratio) ---")
-    print(f"最小: {comp.min():.4f}")
-    print(f"最大: {comp.max():.4f}")
-    print(f"平均: {comp.mean():.4f}")
-    print(f"中位: {np.median(comp):.4f}")
-    print(f"标准差: {comp.std():.4f}")
+    print(f"\n--- 复杂度分布 (α = path_ratio = path_length / straight_dist) ---")
+    print(f"最小: {comp.min():.2f}")
+    print(f"最大: {comp.max():.2f}")
+    print(f"平均: {comp.mean():.2f}")
+    print(f"中位: {np.median(comp):.2f}")
+    print(f"标准差: {comp.std():.2f}")
 
-    print(f"\n--- 百分位数 (复杂度) ---")
+    print(f"\n--- 百分位数 (path_ratio α) ---")
     percentiles = [1, 5, 10, 25, 50, 75, 90, 95, 99]
     for p in percentiles:
         value = np.percentile(comp, p)
-        # 反推 path_ratio: complexity = 1 - 1/ratio => ratio = 1/(1-complexity)
-        if value < 1.0:
-            ratio = 1.0 / (1.0 - value + 1e-8)
-        else:
-            ratio = float('inf')
-        print(f"  {p:2d}%: {value:.4f} (ratio ≈ {ratio:.2f})")
+        # α' = 1/(α+1) 是 embedding 变换后的值
+        alpha_prime = 1.0 / (value + 1.0)
+        print(f"  {p:2d}%: α={value:.2f} (α'={alpha_prime:.3f})")
 
-    print(f"\n--- 分布区间 (复杂度) ---")
-    # 复杂度区间及对应的 alpha 参考值
-    bins = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    print(f"\n--- 分布区间 (path_ratio α) ---")
+    # 论文推荐 α ∈ [1, ~10]，实验用 α 经 1/(α+1) 变换后 ∈ [0.3, 0.8]
+    bins = [1.0, 1.5, 2.0, 3.0, 5.0, 7.5, 10.0, 20.0, float('inf')]
+    bin_labels = ['1.0-1.5', '1.5-2.0', '2.0-3.0', '3.0-5.0', '5.0-7.5', '7.5-10', '10-20', '20+']
     for i in range(len(bins) - 1):
         mask = (comp >= bins[i]) & (comp < bins[i+1])
         count = mask.sum()
         pct = count / len(comp) * 100
         bar = '#' * int(pct / 2)
-        print(f"  {bins[i]:.1f}-{bins[i+1]:.1f}: {count:>6,} ({pct:5.1f}%) {bar}")
+        print(f"  {bin_labels[i]:>8}: {count:>6,} ({pct:5.1f}%) {bar}")
 
     # 与 alpha 的对应关系建议
-    print(f"\n--- 与模型 alpha 参数的对应 ---")
-    print(f"  如果使用 alpha=0.3, 目标 complexity ≈ 0.3")
-    print(f"  如果使用 alpha=0.5, 目标 complexity ≈ 0.5")
-    print(f"  如果使用 alpha=0.7, 目标 complexity ≈ 0.7")
-    print(f"\n  人类数据复杂度中位数: {np.median(comp):.4f}")
-    print(f"  建议使用 alpha ≈ {np.median(comp):.2f} 以匹配人类分布")
+    print(f"\n--- 论文 α 参数说明 ---")
+    print(f"  论文语义: α 越大 → 轨迹越复杂")
+    print(f"  α = 1: 直线轨迹（最简单）")
+    print(f"  α = 2: 路径长度是直线距离的2倍")
+    print(f"  α = 5: 路径长度是直线距离的5倍")
+    print(f"\n  Style Embedding 变换: α' = 1/(α+1)")
+    print(f"  α=1 → α'=0.50 (简单)")
+    print(f"  α=3 → α'=0.25 (中等)")
+    print(f"  α=9 → α'=0.10 (复杂)")
+    print(f"\n  人类数据 path_ratio 中位数: {np.median(comp):.2f}")
+    print(f"  建议训练时使用 α ≈ {np.median(comp):.1f}")
 
 
 def analyze_dataset(data_dir: Path, dataset_name: str, file_type: str = "auto") -> tuple:

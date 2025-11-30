@@ -85,7 +85,7 @@ class TrajectoryGenerator:
         self,
         start_point: Tuple[float, float],
         end_point: Tuple[float, float],
-        alpha: float = 0.5,
+        alpha: float = 1.5,
         num_inference_steps: int = 50,
         normalized_input: bool = False,
         return_normalized: bool = False,
@@ -96,7 +96,7 @@ class TrajectoryGenerator:
         Args:
             start_point: 起点坐标 (x, y)
             end_point: 终点坐标 (x, y)
-            alpha: 复杂度参数 ∈ [0.3, 0.8]
+            alpha: 复杂度参数 (path_ratio ∈ [1, +∞), 1=直线, 1.5=默认)
             num_inference_steps: 推理步数
             normalized_input: 输入坐标是否已归一化
             return_normalized: 是否返回归一化的坐标
@@ -146,7 +146,7 @@ class TrajectoryGenerator:
         self,
         start_points: np.ndarray,
         end_points: np.ndarray,
-        alpha: float = 0.5,
+        alpha: float = 1.5,
         num_inference_steps: int = 50,
         normalized_input: bool = False,
         return_normalized: bool = False,
@@ -157,7 +157,7 @@ class TrajectoryGenerator:
         Args:
             start_points: 起点数组 (batch, 2)
             end_points: 终点数组 (batch, 2)
-            alpha: 复杂度参数 ∈ [0.3, 0.8]
+            alpha: 复杂度参数 (path_ratio ∈ [1, +∞), 1=直线, 1.5=默认)
             num_inference_steps: 推理步数
             normalized_input: 输入坐标是否已归一化
             return_normalized: 是否返回归一化的坐标
@@ -204,7 +204,7 @@ class TrajectoryGenerator:
         start_point: Tuple[float, float],
         end_point: Tuple[float, float],
         num_samples: int = 5,
-        alpha_range: Tuple[float, float] = (0.3, 0.8),
+        alpha_range: Tuple[float, float] = (1.0, 3.0),
     ) -> List[np.ndarray]:
         """
         生成不同复杂度的轨迹
@@ -430,7 +430,7 @@ if __name__ == "__main__":
     dmtg_traj = dmtg_gen.generate(
         start_point=(100, 100),
         end_point=(500, 400),
-        alpha=0.5
+        alpha=1.5
     )
     print(f"DMTG trajectory shape: {dmtg_traj.shape}")
 
@@ -439,10 +439,10 @@ if __name__ == "__main__":
     trajectories = dmtg_gen.generate_with_complexity_range(
         (100, 100), (500, 400),
         num_samples=3,
-        alpha_range=(0.1, 0.9)
+        alpha_range=(1.0, 3.0)
     )
     for i, traj in enumerate(trajectories):
-        print(f"  Alpha={0.1 + i * 0.4:.1f}: trajectory length = {len(traj)}")
+        print(f"  Alpha={1.0 + i * 1.0:.1f}: trajectory length = {len(traj)}")
 
     # 测试添加时间
     timed_traj = dmtg_gen.add_timing(dmtg_traj, total_duration_ms=500)

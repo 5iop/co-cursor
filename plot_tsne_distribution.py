@@ -121,9 +121,10 @@ def extract_trajectory_features(trajectory: np.ndarray) -> np.ndarray:
     bbox_height = traj[:, 1].max() - traj[:, 1].min()
     bbox_area = bbox_width * bbox_height
 
-    # 9. 复杂度 (β/(β+1))
-    beta = path_ratio - 1.0
-    complexity = beta / (beta + 1.0 + 1e-8)
+    # 9. 复杂度（论文方案A: 直接使用 path_ratio）
+    # α = path_ratio，α=1 表示直线，α 越大越复杂
+    # 注: path_ratio 已在特征 0 中，这里保留用于对比
+    complexity = max(path_ratio, 1.0)
 
     features = np.array([
         path_ratio,
@@ -429,13 +430,18 @@ def plot_tsne_distribution(
         'sapimouse': '#6F42C1',   # 紫色
         'unknown': '#6C757D',     # 灰色
     }
-    # 模型 alpha 颜色映射
-    alpha_colors = {
-        0.3: '#FF9999',  # 粉红
-        0.5: '#F18F01',  # 橙色
-        0.7: '#C73E1D',  # 深红
-        0.8: '#A23B72',  # 紫色
-    }
+    # 模型 alpha 颜色映射 (Paper A: α >= 1, 使用高区分度的颜色)
+    # 使用 tab10 色板中差异明显的颜色
+    alpha_color_palette = [
+        '#E94F37',  # 红色
+        '#F18F01',  # 橙色
+        '#44AF69',  # 绿色
+        '#2D93AD',  # 青色
+        '#A23B72',  # 紫红
+        '#6F42C1',  # 紫色
+        '#C44536',  # 深红
+        '#1B998B',  # 深青
+    ]
     default_model_color = '#E94F37'
 
     # 人类分布（按来源区分颜色）
@@ -452,13 +458,13 @@ def plot_tsne_distribution(
                   c=human_source_colors['boun'], alpha=0.3, s=10, label='Human')
 
     if alpha_labels is not None and len(alpha_labels) == len(model_emb):
-        # 按不同 alpha 值分别绘制
+        # 按不同 alpha 值分别绘制，使用调色板循环分配颜色
         unique_alphas = sorted(set(alpha_labels))
-        for alpha in unique_alphas:
+        for i, alpha in enumerate(unique_alphas):
             mask = alpha_labels == alpha
-            color = alpha_colors.get(alpha, default_model_color)
+            color = alpha_color_palette[i % len(alpha_color_palette)]
             ax.scatter(model_emb[mask, 0], model_emb[mask, 1],
-                      c=color, alpha=0.6, s=15, label=f'α={alpha}')
+                      c=color, alpha=0.7, s=20, label=f'α={alpha}')
     else:
         ax.scatter(model_emb[:, 0], model_emb[:, 1], c=default_model_color, alpha=0.6, s=15, label=model_name)
 
@@ -518,6 +524,8 @@ def main():
 
     parser.add_argument("--checkpoint", "-c", type=str, default="checkpoints/best_model.pt",
                        help="Model checkpoint path (default: checkpoints/best_model.pt)")
+    parser.add_argument("--human_data", type=str, default=None,
+                       help="Human trajectory data directory (overrides boun_data)")
     parser.add_argument("--boun_data", type=str, default="datasets/boun-processed",
                        help="BOUN trajectory data directory")
     parser.add_argument("--open_images_data", type=str, default="datasets/open_images_v6",
@@ -528,8 +536,8 @@ def main():
                        help="Number of human samples")
     parser.add_argument("--num_model", type=int, default=500,
                        help="Number of model samples")
-    parser.add_argument("--alphas", type=float, nargs="+", default=[0.3, 0.5, 0.7],
-                       help="Alpha values for generation")
+    parser.add_argument("--alphas", type=float, nargs="+", default=[1.0, 1.5, 2.0, 3.0],
+                       help="Alpha values for generation (Paper A: path_ratio >= 1)")
     parser.add_argument("--output_dir", "-o", type=str, default="outputs",
                        help="Output directory")
     parser.add_argument("--label", "-l", type=str, default=None,
@@ -583,7 +591,9 @@ def main():
 
     # 加载人类轨迹
     base_dir = Path(__file__).parent
-    boun_path = base_dir / args.boun_data if args.boun_data else None
+    # --human_data 优先覆盖 boun_data
+    boun_data_dir = args.human_data if args.human_data else args.boun_data
+    boun_path = base_dir / boun_data_dir if boun_data_dir else None
     open_images_path = base_dir / args.open_images_data if args.open_images_data else None
     sapimouse_path = base_dir / args.sapimouse_data if args.sapimouse_data else None
 

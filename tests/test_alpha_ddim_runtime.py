@@ -21,7 +21,7 @@ class TestBasicSampling:
             trajectories = ddim.sample(
                 batch_size=4,
                 condition=sample_condition,
-                alpha=0.5,
+                alpha=2.0,  # path_ratio=2 (中等复杂度)
                 num_inference_steps=10,
                 device=device,
             )
@@ -33,7 +33,7 @@ class TestBasicSampling:
             trajectories = ddim.sample(
                 batch_size=4,
                 condition=sample_condition,
-                alpha=0.5,
+                alpha=2.0,  # path_ratio=2 (中等复杂度)
                 effective_length=50,
                 num_inference_steps=10,
                 device=device,
@@ -41,8 +41,8 @@ class TestBasicSampling:
         assert trajectories.shape == (4, 100, 2)
 
     def test_sample_different_alpha(self, ddim, sample_condition, device):
-        """测试不同 alpha 值"""
-        for alpha in [0.0, 0.3, 0.5, 0.8, 1.0]:
+        """测试不同 alpha 值 (论文方案A: path_ratio ∈ [1, +∞))"""
+        for alpha in [1.0, 1.5, 2.0, 3.0, 5.0]:
             with torch.no_grad():
                 trajectories = ddim.sample(
                     batch_size=2,
@@ -63,7 +63,7 @@ class TestPerSampleLength:
             trajectories = ddim.sample(
                 batch_size=4,
                 condition=sample_condition,
-                alpha=0.5,
+                alpha=2.0,  # path_ratio=2 (中等复杂度)
                 effective_length=per_sample_lengths,
                 num_inference_steps=10,
                 device=device,
@@ -78,7 +78,7 @@ class TestPerSampleLength:
             trajectories = ddim.sample(
                 batch_size=4,
                 condition=sample_condition,
-                alpha=0.5,
+                alpha=2.0,  # path_ratio=2 (中等复杂度)
                 effective_length=per_sample_lengths,
                 num_inference_steps=10,
                 device=device,
@@ -98,7 +98,7 @@ class TestPerSampleLength:
             trajectories = ddim.sample(
                 batch_size=batch_size,
                 condition=sample_condition,
-                alpha=0.5,
+                alpha=2.0,  # path_ratio=2 (中等复杂度)
                 effective_length=per_sample_lengths,
                 num_inference_steps=10,
                 device=device,
@@ -120,7 +120,7 @@ class TestPerSampleLength:
             trajectories = ddim.sample(
                 batch_size=4,
                 condition=sample_condition,
-                alpha=0.5,
+                alpha=2.0,  # path_ratio=2 (中等复杂度)
                 effective_length=lengths,
                 num_inference_steps=10,
                 device=device,
@@ -141,7 +141,7 @@ class TestBoundaryConditions:
             trajectories = ddim.sample(
                 batch_size=4,
                 condition=sample_condition,
-                alpha=0.5,
+                alpha=2.0,  # path_ratio=2 (中等复杂度)
                 num_inference_steps=10,
                 device=device,
             )
@@ -158,7 +158,7 @@ class TestBoundaryConditions:
             trajectories = ddim.sample(
                 batch_size=4,
                 condition=sample_condition,
-                alpha=0.5,
+                alpha=2.0,  # path_ratio=2 (中等复杂度)
                 num_inference_steps=10,
                 device=device,
             )
@@ -177,7 +177,7 @@ class TestBoundaryConditions:
                 trajectories = ddim.sample(
                     batch_size=4,
                     condition=sample_condition,
-                    alpha=0.5,
+                    alpha=2.0,  # path_ratio=2 (中等复杂度)
                     effective_length=length,
                     num_inference_steps=10,
                     device=device,
@@ -201,7 +201,7 @@ class TestLengthPrediction:
             trajectories, lengths = ddim.sample_with_auto_length(
                 batch_size=4,
                 condition=sample_condition,
-                alpha=0.5,
+                alpha=2.0,  # path_ratio=2 (中等复杂度)
                 num_inference_steps=10,
                 use_per_sample_length=True,
                 device=device,
@@ -216,7 +216,7 @@ class TestLengthPrediction:
         """测试不同 alpha 下的长度预测"""
         lengths_by_alpha = {}
 
-        for alpha in [0.3, 0.5, 0.8]:
+        for alpha in [1.5, 2.0, 3.0]:  # path_ratio 范围
             with torch.no_grad():
                 _, lengths = ddim.sample_with_auto_length(
                     batch_size=4,
@@ -239,7 +239,7 @@ class TestLengthPrediction:
                 ddim_no_length.sample_with_auto_length(
                     batch_size=4,
                     condition=sample_condition,
-                    alpha=0.5,
+                    alpha=2.0,  # path_ratio=2 (中等复杂度)
                     device=device,
                 )
 
@@ -249,7 +249,7 @@ class TestLengthPrediction:
             trajectories = ddim.sample(
                 batch_size=4,
                 condition=sample_condition,
-                alpha=0.5,
+                alpha=2.0,  # path_ratio=2 (中等复杂度)
                 auto_length=True,
                 num_inference_steps=10,
                 device=device,
@@ -308,7 +308,7 @@ class TestNumericalStability:
             trajectories = ddim.sample(
                 batch_size=4,
                 condition=sample_condition,
-                alpha=0.5,
+                alpha=2.0,  # path_ratio=2 (中等复杂度)
                 num_inference_steps=10,
                 device=device,
             )
@@ -318,7 +318,7 @@ class TestNumericalStability:
 
     def test_extreme_alpha_values(self, ddim, sample_condition, device):
         """测试极端 alpha 值"""
-        for alpha in [0.0, 1.0]:
+        for alpha in [1.0, 10.0]:  # 极端 path_ratio 值
             with torch.no_grad():
                 trajectories = ddim.sample(
                     batch_size=2,
@@ -339,7 +339,7 @@ class TestNumericalStability:
             trajectories = ddim.sample(
                 batch_size=4,
                 condition=sample_condition,
-                alpha=0.5,
+                alpha=2.0,  # path_ratio=2 (中等复杂度)
                 effective_length=lengths,
                 num_inference_steps=10,
                 device=device,
@@ -358,7 +358,7 @@ class TestNumericalStability:
             trajectories = ddim.sample(
                 batch_size=4,
                 condition=condition,
-                alpha=0.5,
+                alpha=2.0,  # path_ratio=2 (中等复杂度)
                 num_inference_steps=10,
                 device=device,
             )

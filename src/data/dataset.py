@@ -39,6 +39,7 @@ class MouseTrajectoryDataset(Dataset):
         normalize: bool = True,
         screen_size: Tuple[int, int] = (1920, 1080),
         min_trajectory_length: int = 10,
+        min_straight_dist: float = 0.01,  # 最小起终点直线距离（归一化后）
         lazy: bool = False,  # 是否启用懒加载
     ):
         """
@@ -49,6 +50,7 @@ class MouseTrajectoryDataset(Dataset):
             normalize: 是否归一化坐标（BOUN Parquet数据已预归一化）
             screen_size: 屏幕尺寸 (width, height)
             min_trajectory_length: 最小轨迹长度
+            min_straight_dist: 最小起终点直线距离，过滤掉起终点太近的轨迹（避免 path_ratio 爆炸）
             lazy: 是否启用懒加载（仅支持 Parquet 格式）
         """
         self.data_dir = Path(data_dir)
@@ -57,6 +59,7 @@ class MouseTrajectoryDataset(Dataset):
         self.normalize = normalize
         self.screen_size = screen_size
         self.min_trajectory_length = min_trajectory_length
+        self.min_straight_dist = min_straight_dist
         self.lazy = lazy
 
         # Eager模式: 存储 (coords, length, timestamps) 元组，timestamps 可为 None
@@ -67,7 +70,14 @@ class MouseTrajectoryDataset(Dataset):
         self._parquet_cache = {}  # file_path -> (x_col, y_col)
         self._cache_max_files = 3  # 最多缓存3个文件
 
+        self._filtered_count = 0  # 记录被过滤的轨迹数量
         self._load_data()
+
+    def _compute_straight_dist(self, coords: np.ndarray) -> float:
+        """计算起终点直线距离"""
+        if len(coords) < 2:
+            return 0.0
+        return np.linalg.norm(coords[-1] - coords[0])
 
     def _load_data(self):
         """加载所有轨迹数据"""
@@ -84,7 +94,8 @@ class MouseTrajectoryDataset(Dataset):
         else:
             raise ValueError(f"Unknown dataset type: {self.dataset_type}")
 
-        print(f"Loaded {len(self.trajectories)} trajectories from {self.dataset_type}")
+        print(f"Loaded {len(self.trajectories)} trajectories from {self.dataset_type}"
+              f" (filtered {self._filtered_count} with straight_dist < {self.min_straight_dist})")
 
     def _load_sapimouse(self):
         """加载SapiMouse数据集（使用PyArrow）"""
@@ -150,6 +161,12 @@ class MouseTrajectoryDataset(Dataset):
                 # 数据已归一化，直接构建坐标数组
                 coords = np.column_stack([x_list, y_list]).astype(np.float32)
 
+                # 过滤起终点距离过小的轨迹
+                straight_dist = self._compute_straight_dist(coords)
+                if straight_dist < self.min_straight_dist:
+                    self._filtered_count += 1
+                    continue
+
                 # 截断过长的轨迹
                 if len(coords) > self.max_length:
                     coords = coords[:self.max_length]
@@ -209,6 +226,13 @@ class MouseTrajectoryDataset(Dataset):
 
                     # 数据已归一化，直接构建坐标数组
                     coords = np.column_stack([x_list, y_list]).astype(np.float32)
+
+                    # 过滤起终点距离过小的轨迹
+                    straight_dist = self._compute_straight_dist(coords)
+                    if straight_dist < self.min_straight_dist:
+                        self._filtered_count += 1
+                        continue
+
                     timestamps = np.array(t_col[i].as_py(), dtype=np.float32) if t_col else None
 
                     # 截断过长的轨迹
@@ -265,6 +289,13 @@ class MouseTrajectoryDataset(Dataset):
                 if len(traj) >= self.min_trajectory_length:
                     if self.normalize:
                         traj = self._normalize_coords(traj)
+
+                    # 过滤起终点距离过小的轨迹
+                    straight_dist = self._compute_straight_dist(traj)
+                    if straight_dist < self.min_straight_dist:
+                        self._filtered_count += 1
+                        continue
+
                     if len(traj) > self.max_length:
                         traj = traj[:self.max_length]
                     results.append((traj.astype(np.float32), len(traj)))
@@ -325,6 +356,12 @@ class MouseTrajectoryDataset(Dataset):
                 coords = self._normalize_coords(coords)
             elif is_normalized:
                 coords = np.clip(coords, 0.0, 1.0)
+
+            # 过滤起终点距离过小的轨迹
+            straight_dist = self._compute_straight_dist(coords)
+            if straight_dist < self.min_straight_dist:
+                self._filtered_count += 1
+                continue
 
             if len(coords) > self.max_length:
                 coords = coords[:self.max_length]
@@ -459,6 +496,7 @@ class CombinedMouseDataset(Dataset):
         max_length: int = 500,
         normalize: bool = True,
         max_samples: Optional[int] = None,
+        min_straight_dist: float = 0.01,  # 最小起终点直线距离
         lazy: bool = False,  # 是否启用懒加载（仅对Parquet格式有效）
     ):
         self.max_length = max_length
@@ -474,6 +512,7 @@ class CombinedMouseDataset(Dataset):
                     dataset_type="sapimouse",
                     max_length=max_length,
                     normalize=normalize,
+                    min_straight_dist=min_straight_dist,
                     lazy=False,  # CSV格式不支持lazy
                 )
             )
@@ -489,6 +528,7 @@ class CombinedMouseDataset(Dataset):
                         dataset_type="boun_parquet",
                         max_length=max_length,
                         normalize=normalize,
+                        min_straight_dist=min_straight_dist,
                         lazy=lazy,
                     )
                 )
@@ -501,6 +541,7 @@ class CombinedMouseDataset(Dataset):
                         dataset_type="boun_jsonl",
                         max_length=max_length,
                         normalize=normalize,
+                        min_straight_dist=min_straight_dist,
                         lazy=False,
                     )
                 )
@@ -519,6 +560,7 @@ class CombinedMouseDataset(Dataset):
                         dataset_type="open_images_parquet",
                         max_length=max_length,
                         normalize=normalize,
+                        min_straight_dist=min_straight_dist,
                         lazy=lazy,
                     )
                 )
@@ -531,6 +573,7 @@ class CombinedMouseDataset(Dataset):
                         dataset_type="open_images",
                         max_length=max_length,
                         normalize=normalize,
+                        min_straight_dist=min_straight_dist,
                         lazy=False,
                     )
                 )
@@ -637,6 +680,7 @@ def create_dataloader(
     max_samples: int = None,
     val_split: float = 0.1,
     return_val: bool = True,
+    min_straight_dist: float = 0.01,
     lazy: bool = False,
 ) -> Tuple[DataLoader, Optional[DataLoader]]:
     """
@@ -653,6 +697,7 @@ def create_dataloader(
         max_samples: 最大样本数
         val_split: 验证集比例
         return_val: 是否返回验证集
+        min_straight_dist: 最小起终点直线距离，过滤掉起终点太近的轨迹
         lazy: 是否启用懒加载（适合大数据集，节省内存）
 
     Returns:
@@ -664,6 +709,7 @@ def create_dataloader(
         open_images_dir=open_images_dir,
         max_length=max_length,
         max_samples=max_samples,
+        min_straight_dist=min_straight_dist,
         lazy=lazy,
     )
 
