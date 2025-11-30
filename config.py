@@ -87,6 +87,16 @@ class EvaluationConfig:
 
 
 @dataclass
+class NotificationConfig:
+    """通知配置"""
+    enabled: bool = False
+    webhook_url: str = "https://ntfy.jangit.me/notify/notifytg"
+    notify_every_epoch: int = 1  # 每N个epoch通知一次
+    notify_on_best: bool = True  # 保存best model时通知
+    send_images: bool = True  # 是否发送图片
+
+
+@dataclass
 class DMTGConfig:
     """完整配置"""
     data: DataConfig = field(default_factory=DataConfig)
@@ -94,6 +104,7 @@ class DMTGConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
+    notification: NotificationConfig = field(default_factory=NotificationConfig)
 
     device: str = "cuda"
     seed: int = 42
