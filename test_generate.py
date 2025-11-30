@@ -22,6 +22,7 @@ from datetime import datetime
 import platform
 
 from src.models.alpha_ddim import create_alpha_ddim, EntropyController
+from src.utils.notify import send_image_result
 
 # 设置中文字体
 def setup_chinese_font():
@@ -680,6 +681,8 @@ def main():
                        help="Don't display the plot (useful for background execution)")
     parser.add_argument("--acceleration_dist", action="store_true",
                        help="Generate acceleration direction distribution plot (Fig.6)")
+    parser.add_argument("--webhook", type=str, default=None,
+                       help="Webhook URL to send result images (e.g. https://ntfy.jangit.me/notify/notifytg)")
     args = parser.parse_args()
 
     # 创建输出目录
@@ -807,6 +810,20 @@ def main():
 
     print(f"\n图表已保存到 {save_path}")
 
+    # 发送 webhook 通知
+    if args.webhook:
+        print(f"\n正在发送通知到 webhook...")
+        success = send_image_result(
+            title=f"DMTG Generate - {args.label or 'test'}",
+            image_path=str(save_path),
+            description=f"Alphas: {alphas}\nSamples: {len(all_results)}",
+            webhook_url=args.webhook,
+        )
+        if success:
+            print("通知发送成功!")
+        else:
+            print("通知发送失败")
+
     # 加速度方向分布图 (论文 Fig.6)
     if args.acceleration_dist:
         print("\n正在生成加速度方向分布图...")
@@ -820,6 +837,14 @@ def main():
             save_path=accel_save_path,
             no_display=args.no_display
         )
+        # 发送加速度分布图到 webhook
+        if args.webhook:
+            send_image_result(
+                title=f"DMTG Acceleration - {args.label or 'test'}",
+                image_path=str(accel_save_path),
+                description="Acceleration direction distribution (Fig.6)",
+                webhook_url=args.webhook,
+            )
 
     print("完成!")
 

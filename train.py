@@ -31,6 +31,7 @@ from src.data.dataset import CombinedMouseDataset, create_dataloader
 from src.models.unet import TrajectoryUNet
 from src.models.alpha_ddim import AlphaDDIM
 from src.models.losses import DMTGLoss
+from src.utils.notify import send_training_update
 
 
 # ==================== DDP 工具函数 ====================
@@ -108,6 +109,9 @@ class Trainer:
         # 自动绘图选项
         plot: bool = False,
         human_data_dir: str = None,
+        # 通知选项
+        webhook_url: str = None,
+        notify_every: int = 5,
     ):
         self.device = device
         self.model = model.to(device)
@@ -169,6 +173,10 @@ class Trainer:
         self.plot = plot
         self.human_data_dir = human_data_dir
         self.training_start_time = datetime.now().strftime("%y%m%d%H%M%S")
+
+        # 通知选项
+        self.webhook_url = webhook_url
+        self.notify_every = notify_every
 
     def train_epoch(self) -> float:
         """训练一个epoch"""
@@ -401,6 +409,10 @@ class Trainer:
                 if self.human_data_dir:
                     cmd.extend(["--human_data", self.human_data_dir])
 
+                # 添加 webhook 参数
+                if self.webhook_url:
+                    cmd.extend(["--webhook", self.webhook_url])
+
                 print(f"[t-SNE] Starting background plot: {label}")
                 result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
@@ -422,6 +434,10 @@ class Trainer:
                     "--device", "cpu",
                     "--no_display",
                 ]
+
+                # 添加 webhook 参数
+                if self.webhook_url:
+                    cmd.extend(["--webhook", self.webhook_url])
 
                 print(f"[Generate] Starting background test: {label}")
                 result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
@@ -527,14 +543,46 @@ class Trainer:
                     self.best_loss = val_loss
                     self.save_checkpoint("best_model.pt")
                     self.run_tsne_plot_async()  # 后台运行 t-SNE 绘图
+                    # 发送 best model 通知
+                    if self.webhook_url:
+                        send_training_update(
+                            epoch=self.epoch,
+                            loss=val_loss,
+                            best_loss=self.best_loss,
+                            is_best=True,
+                            webhook_url=self.webhook_url,
+                            extra_info="New best model saved!",
+                        )
             else:
                 if train_loss < self.best_loss:
                     self.best_loss = train_loss
                     self.save_checkpoint("best_model.pt")
                     self.run_tsne_plot_async()  # 后台运行 t-SNE 绘图
+                    # 发送 best model 通知
+                    if self.webhook_url:
+                        send_training_update(
+                            epoch=self.epoch,
+                            loss=train_loss,
+                            best_loss=self.best_loss,
+                            is_best=True,
+                            webhook_url=self.webhook_url,
+                            extra_info="New best model saved!",
+                        )
 
             # 更新学习率
             self.scheduler.step()
+
+            # 周期性训练进度通知
+            if self.webhook_url and self.epoch % self.notify_every == 0:
+                current_loss = val_loss if self.val_loader else train_loss
+                send_training_update(
+                    epoch=self.epoch,
+                    loss=current_loss,
+                    best_loss=self.best_loss,
+                    is_best=False,
+                    webhook_url=self.webhook_url,
+                    extra_info=f"LR: {self.scheduler.get_last_lr()[0]:.2e}",
+                )
 
             # 定期保存检查点
             if self.epoch % 10 == 0:
@@ -705,6 +753,20 @@ def parse_args():
         help="保存 best_model 后自动在后台运行 t-SNE 分布图和轨迹生成测试"
     )
 
+    # 通知选项
+    parser.add_argument(
+        "--webhook",
+        type=str,
+        default=None,
+        help="Webhook URL 用于发送训练通知和图片 (e.g. https://ntfy.jangit.me/notify/notifytg)"
+    )
+    parser.add_argument(
+        "--notify_every",
+        type=int,
+        default=5,
+        help="每N个epoch发送一次训练进度通知 (默认: 5)"
+    )
+
     return parser.parse_args()
 
 
@@ -857,7 +919,20 @@ def main():
         # 自动绘图选项
         plot=args.plot,
         human_data_dir=boun_path,  # 使用 BOUN 数据作为人类轨迹参考
+        # 通知选项
+        webhook_url=args.webhook,
+        notify_every=args.notify_every,
     )
+
+    # 发送训练开始通知
+    if args.webhook and is_main_process():
+        send_training_update(
+            epoch=0,
+            loss=0,
+            best_loss=float('inf'),
+            webhook_url=args.webhook,
+            extra_info=f"Training started!\nEpochs: {args.num_epochs}\nBatch size: {args.batch_size}\nSamples: {len(train_dataset)}",
+        )
 
     # 恢复训练
     if args.resume:

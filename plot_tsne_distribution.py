@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.models.alpha_ddim import create_alpha_ddim
 from src.data.dataset import CombinedMouseDataset
+from src.utils.notify import send_image_result
 
 
 def setup_chinese_font():
@@ -547,6 +548,8 @@ def main():
                        help="Use fixed length (100) for generation (useful for untrained models)")
     parser.add_argument("--no_display", action="store_true",
                        help="Don't display the plot (useful for background execution)")
+    parser.add_argument("--webhook", type=str, default=None,
+                       help="Webhook URL to send result image (e.g. https://ntfy.jangit.me/notify/notifytg)")
 
     args = parser.parse_args()
 
@@ -624,6 +627,20 @@ def main():
         human_sources=human_sources,
         no_display=args.no_display,
     )
+
+    # 发送 webhook 通知
+    if args.webhook:
+        print("\n正在发送通知到 webhook...")
+        success = send_image_result(
+            title=f"DMTG t-SNE - {args.label or 'distribution'}",
+            image_path=str(output_path),
+            description=f"Human: {args.num_human}, Model: {args.num_model}\nAlphas: {args.alphas}",
+            webhook_url=args.webhook,
+        )
+        if success:
+            print("通知发送成功!")
+        else:
+            print("通知发送失败")
 
     print("\nDone!")
 
