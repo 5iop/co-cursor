@@ -8,6 +8,7 @@ DMTG训练脚本
 """
 import os
 import sys
+import signal
 import argparse
 import torch
 import torch.nn as nn
@@ -31,7 +32,7 @@ from src.data.dataset import CombinedMouseDataset, create_dataloader
 from src.models.unet import TrajectoryUNet
 from src.models.alpha_ddim import AlphaDDIM
 from src.models.losses import DMTGLoss
-from src.utils.notify import send_training_update
+from src.utils.notify import send_training_update, send_notification
 
 
 # ==================== DDP 工具函数 ====================
@@ -883,9 +884,35 @@ def main():
         # 传入 total_epochs 以正确重置 LR scheduler
         trainer.load_checkpoint(args.resume, total_epochs=args.num_epochs)
 
+    # ==================== 信号处理 ====================
+    def handle_signal(signum, frame):
+        """处理终止信号，发送通知"""
+        sig_name = signal.Signals(signum).name
+        if is_main_process() and args.webhook:
+            send_notification(
+                title=f"DMTG Training Interrupted",
+                body=f"Signal: {sig_name} ({signum})\nEpoch: {trainer.epoch}\nBest Loss: {trainer.best_loss:.4f}",
+                webhook_url=args.webhook,
+            )
+        cleanup_distributed()
+        sys.exit(1)
+
+    # 注册信号处理器（SIGKILL 无法捕获）
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)  # Ctrl+C
+
     # ==================== 开始训练 ====================
     try:
         trainer.train(args.num_epochs)
+    except Exception as e:
+        # 捕获异常并发送通知
+        if is_main_process() and args.webhook:
+            send_notification(
+                title=f"DMTG Training Failed",
+                body=f"Error: {str(e)[:200]}\nEpoch: {trainer.epoch}\nBest Loss: {trainer.best_loss:.4f}",
+                webhook_url=args.webhook,
+            )
+        raise
     finally:
         # 清理 DDP
         cleanup_distributed()
