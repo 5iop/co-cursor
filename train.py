@@ -639,8 +639,13 @@ def parse_args():
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=16,  # 多线程数据加载
+        default=4,
         help="数据加载工作进程数"
+    )
+    parser.add_argument(
+        "--no_persistent_workers",
+        action="store_true",
+        help="禁用 persistent_workers 以节省内存"
     )
 
     # 其他参数
@@ -803,7 +808,7 @@ def main():
         sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
-        persistent_workers=args.num_workers > 0,
+        persistent_workers=args.num_workers > 0 and not args.no_persistent_workers,
     )
 
     val_loader = DataLoader(
@@ -813,7 +818,7 @@ def main():
         sampler=val_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
-        persistent_workers=args.num_workers > 0,
+        persistent_workers=args.num_workers > 0 and not args.no_persistent_workers,
     ) if val_size > 0 else None
 
     if is_main_process():
