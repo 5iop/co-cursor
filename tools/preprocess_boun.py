@@ -4,21 +4,17 @@ BOUN数据集预处理脚本
 输出Parquet格式（PyArrow内部并行处理）
 
 列结构：
-- trajectory_id: uint32 - 全局轨迹ID
-- user_id: string - 用户ID
-- test_type: string - 测试类型
-- session_id: string - 会话ID
 - x: list<float32> - x坐标序列（归一化）
 - y: list<float32> - y坐标序列（归一化）
-- t: list<float32> - 时间戳序列（秒，相对于片段开始）
+- dt: list<float32> - 时间差序列（毫秒，dt[0]=0, dt[i]=t[i]-t[i-1]）
+- user_id: string - 用户ID
 """
 import re
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 import argparse
-import shutil
-from typing import List, Tuple, Dict
+from typing import List, Tuple
 
 import pyarrow as pa
 import pyarrow.csv as pv
@@ -29,17 +25,28 @@ SCREEN_WIDTH = 1920
 SCREEN_HEIGHT = 1080
 
 
-def process_session(csv_path: Path, min_steps: int = 10) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+def compute_straight_dist(x_norm: np.ndarray, y_norm: np.ndarray) -> float:
+    """计算起终点直线距离（归一化坐标）"""
+    if len(x_norm) < 2:
+        return 0.0
+    dx = x_norm[-1] - x_norm[0]
+    dy = y_norm[-1] - y_norm[0]
+    return np.sqrt(dx * dx + dy * dy)
+
+
+def process_session(csv_path: Path, min_steps: int = 10, min_straight_dist: float = 0.01) -> Tuple[List[Tuple[np.ndarray, np.ndarray, np.ndarray]], int]:
     """
     处理单个session文件，按Released分割轨迹
 
     Args:
         csv_path: CSV文件路径
         min_steps: 最小步数阈值
+        min_straight_dist: 最小起终点直线距离（归一化后）
 
     Returns:
-        有效轨迹列表，每个元素是 (x, y, t) 三个数组
+        (有效轨迹列表, 被过滤的轨迹数)
     """
+    filtered_count = 0
     try:
         # 使用PyArrow读取CSV
         table = pv.read_csv(
@@ -56,17 +63,17 @@ def process_session(csv_path: Path, min_steps: int = 10) -> List[Tuple[np.ndarra
         states = table.column('state').to_pylist()
 
     except Exception as e:
-        return []
+        return [], 0
 
     if len(x_data) == 0:
-        return []
+        return [], 0
 
     # 向量化：找到所有Released事件的索引
     states_arr = np.array(states)
     released_indices = np.where(states_arr == 'Released')[0]
 
     if len(released_indices) == 0:
-        return []
+        return [], 0
 
     valid_trajectories = []
     start_idx = 0
@@ -107,21 +114,30 @@ def process_session(csv_path: Path, min_steps: int = 10) -> List[Tuple[np.ndarra
             x_norm = x_vals / SCREEN_WIDTH
             y_norm = y_vals / SCREEN_HEIGHT
 
-            # 转换时间戳：毫秒转秒，相对于片段开始
-            t_norm = ((t_vals - t_vals[0]) / 1000.0).astype(np.float32)
+            # 过滤起终点距离过小的轨迹
+            if compute_straight_dist(x_norm, y_norm) < min_straight_dist:
+                filtered_count += 1
+                start_idx = end_idx + 1
+                continue
 
-            valid_trajectories.append((x_norm, y_norm, t_norm))
+            # 计算时间差 dt (毫秒)
+            # dt[0] = 0, dt[i] = t[i] - t[i-1]
+            # BOUN 原始数据已是毫秒
+            dt = np.zeros_like(t_vals, dtype=np.float32)
+            dt[1:] = np.maximum(0, np.diff(t_vals))  # 确保非负
+
+            valid_trajectories.append((x_norm, y_norm, dt))
 
         start_idx = end_idx + 1
 
-    return valid_trajectories
+    return valid_trajectories, filtered_count
 
 
 def preprocess_boun(
     input_dir: str,
     output_dir: str,
     min_steps: int = 10,
-    clean_output: bool = True,
+    min_straight_dist: float = 0.01,
     users: List[str] = None,
 ):
     """
@@ -131,15 +147,11 @@ def preprocess_boun(
         input_dir: BOUN数据集根目录
         output_dir: 输出目录
         min_steps: 最小步数阈值
-        clean_output: 是否清空输出目录
+        min_straight_dist: 最小起终点直线距离（归一化后）
         users: 只处理指定的用户ID列表 (如 ["user1", "user2"])，None表示处理所有用户
     """
     input_path = Path(input_dir)
     output_path = Path(output_dir)
-
-    # 清空或创建输出目录
-    if clean_output and output_path.exists():
-        shutil.rmtree(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
     # 查找所有CSV文件
@@ -157,18 +169,17 @@ def preprocess_boun(
         csv_files += list(input_path.glob("users/*/training/*.csv"))
 
     print(f"Found {len(csv_files)} session files")
+    print(f"min_straight_dist: {min_straight_dist}")
 
     # 直接收集数据到列表
-    trajectory_ids = []
-    user_ids = []
-    test_types = []
-    session_ids = []
     x_lists = []
     y_lists = []
-    t_lists = []
+    dt_lists = []
+    user_ids = []
 
     total_sessions = 0
     failed_sessions = 0
+    total_filtered = 0
     total_points = 0
     global_id = 0
 
@@ -189,16 +200,14 @@ def preprocess_boun(
         session_id = csv_path.stem
 
         try:
-            trajectories = process_session(csv_path, min_steps)
+            trajectories, filtered = process_session(csv_path, min_steps, min_straight_dist)
+            total_filtered += filtered
 
-            for x, y, t in trajectories:
-                trajectory_ids.append(global_id)
-                user_ids.append(user_id)
-                test_types.append(test_type)
-                session_ids.append(session_id)
+            for x, y, dt in trajectories:
                 x_lists.append(x.tolist())
                 y_lists.append(y.tolist())
-                t_lists.append(t.tolist())
+                dt_lists.append(dt.tolist())
+                user_ids.append(user_id)
 
                 total_points += len(x)
                 global_id += 1
@@ -209,27 +218,12 @@ def preprocess_boun(
     print(f"\nTotal trajectories: {global_id}")
     print("Building Parquet table...")
 
-    # 定义schema
-    schema = pa.schema([
-        ('trajectory_id', pa.uint32()),
-        ('user_id', pa.string()),
-        ('test_type', pa.string()),
-        ('session_id', pa.string()),
-        ('x', pa.list_(pa.float32())),
-        ('y', pa.list_(pa.float32())),
-        ('t', pa.list_(pa.float32())),
-    ])
-
-    # 创建表
     table = pa.table({
-        'trajectory_id': pa.array(trajectory_ids, type=pa.uint32()),
-        'user_id': pa.array(user_ids, type=pa.string()),
-        'test_type': pa.array(test_types, type=pa.string()),
-        'session_id': pa.array(session_ids, type=pa.string()),
         'x': pa.array(x_lists, type=pa.list_(pa.float32())),
         'y': pa.array(y_lists, type=pa.list_(pa.float32())),
-        't': pa.array(t_lists, type=pa.list_(pa.float32())),
-    }, schema=schema)
+        'dt': pa.array(dt_lists, type=pa.list_(pa.float32())),
+        'user_id': pa.array(user_ids, type=pa.string()),
+    })
 
     # 写入Parquet文件
     parquet_file = output_path / "boun_trajectories.parquet"
@@ -249,6 +243,7 @@ def preprocess_boun(
     print("=" * 60)
     print(f"Total sessions processed: {total_sessions}")
     print(f"Failed sessions: {failed_sessions}")
+    print(f"Filtered (straight_dist < {min_straight_dist}): {total_filtered}")
     print(f"Total valid trajectories: {global_id}")
     print(f"Total data points: {total_points}")
     print(f"Average trajectory length: {total_points / max(1, global_id):.1f}")
@@ -261,8 +256,10 @@ def preprocess_boun(
         f.write(f"Output format: Parquet\n")
         f.write(f"Output file: {parquet_file}\n")
         f.write(f"Min steps threshold: {min_steps}\n")
+        f.write(f"Min straight dist: {min_straight_dist}\n")
         f.write(f"Total sessions: {total_sessions}\n")
         f.write(f"Failed sessions: {failed_sessions}\n")
+        f.write(f"Filtered trajectories: {total_filtered}\n")
         f.write(f"Total trajectories: {global_id}\n")
         f.write(f"Total points: {total_points}\n")
 
@@ -271,51 +268,10 @@ def preprocess_boun(
     return {
         'total_sessions': total_sessions,
         'failed_sessions': failed_sessions,
+        'total_filtered': total_filtered,
         'total_trajectories': global_id,
         'total_points': total_points,
     }
-
-
-def analyze_dataset(input_dir: str):
-    """分析原始数据集的状态分布"""
-    input_path = Path(input_dir)
-
-    csv_files = list(input_path.glob("users/*/external_tests/*.csv"))[:10]
-
-    state_counts = {}
-    segment_lengths = []
-
-    for csv_file in tqdm(csv_files, desc="Analyzing"):
-        try:
-            table = pv.read_csv(csv_file)
-            states = table.column('state').to_pylist()
-
-            for state in set(states):
-                count = states.count(state)
-                state_counts[state] = state_counts.get(state, 0) + count
-
-            # 统计Released之间的距离
-            released_idx = [i for i, s in enumerate(states) if s == 'Released']
-            prev_idx = 0
-            for idx in released_idx:
-                segment_lengths.append(idx - prev_idx)
-                prev_idx = idx + 1
-
-        except Exception as e:
-            print(f"Error: {e}")
-
-    print("\n--- State Distribution (sample) ---")
-    total = sum(state_counts.values())
-    for state, count in sorted(state_counts.items(), key=lambda x: -x[1]):
-        print(f"  {state}: {count} ({100*count/total:.1f}%)")
-
-    if segment_lengths:
-        print(f"\n--- Segment Lengths (between Released) ---")
-        print(f"  Min: {min(segment_lengths)}")
-        print(f"  Max: {max(segment_lengths)}")
-        print(f"  Mean: {np.mean(segment_lengths):.1f}")
-        print(f"  Median: {np.median(segment_lengths):.1f}")
-        print(f"  Segments >= 10: {sum(1 for l in segment_lengths if l >= 10)}/{len(segment_lengths)}")
 
 
 def main():
@@ -339,15 +295,10 @@ def main():
         help="Minimum number of Move events per trajectory"
     )
     parser.add_argument(
-        "--no-clean",
-        action="store_true",
-        dest="no_clean",
-        help="Do not clean output directory before processing"
-    )
-    parser.add_argument(
-        "--analyze",
-        action="store_true",
-        help="Only analyze the dataset without processing"
+        "--min_straight_dist",
+        type=float,
+        default=0.01,
+        help="Minimum straight-line distance between start and end (normalized)"
     )
     parser.add_argument(
         "--users",
@@ -359,21 +310,17 @@ def main():
 
     args = parser.parse_args()
 
-    # 项目根目录
     base_dir = Path(__file__).parent.parent
     input_dir = base_dir / args.input_dir
     output_dir = base_dir / args.output_dir
 
-    if args.analyze:
-        analyze_dataset(str(input_dir))
-    else:
-        preprocess_boun(
-            input_dir=str(input_dir),
-            output_dir=str(output_dir),
-            min_steps=args.min_steps,
-            clean_output=not args.no_clean,
-            users=args.users,
-        )
+    preprocess_boun(
+        input_dir=str(input_dir),
+        output_dir=str(output_dir),
+        min_steps=args.min_steps,
+        min_straight_dist=args.min_straight_dist,
+        users=args.users,
+    )
 
 
 if __name__ == "__main__":

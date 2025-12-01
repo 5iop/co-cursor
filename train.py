@@ -365,10 +365,13 @@ class Trainer:
             model_state = self.model_raw.state_dict()
 
         # 提取模型配置（用于正确加载检查点）
+        # DDP 模式下需要通过 .module 访问原始模型属性
+        unet = self.model_raw.model.module if self.distributed else self.model_raw.model
         model_config = {
             'seq_length': self.model_raw.seq_length,
             'timesteps': self.model_raw.timesteps,
-            'base_channels': self.model_raw.model.base_channels if hasattr(self.model_raw.model, 'base_channels') else 64,
+            'input_dim': self.model_raw.input_dim,
+            'base_channels': unet.base_channels if hasattr(unet, 'base_channels') else 64,
         }
 
         checkpoint = {
