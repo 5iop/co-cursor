@@ -28,12 +28,17 @@ aria2c -i download.txt -d . --continue=true
 **远程服务器训练（带 webhook 通知）：**
 
 ```bash
-# 使用 webhook 发送训练进度和可视化结果到远程
-python train.py --num_epochs 100 --batch_size 64 --plot --webhook "ntfys://ntfy.example.com/topic"
+# 单 GPU 训练
+python train.py --num_epochs 100 --batch_size 64 --plot --webhook "https://ntfy.jangit.me/notify/notifytg"
 
-# 多 GPU 训练
-torchrun --nproc_per_node=4 train.py --num_epochs 100 --plot --webhook "your_webhook_url"
+# 多 GPU 训练 (4 GPU)
+# batch_size 是每个 GPU 的批次大小，总 effective batch size = 64 * 4 = 256
+torchrun --nproc_per_node=4 train.py --num_epochs 100 --batch_size 64 --plot --webhook "https://ntfy.jangit.me/notify/notifytg"
 ```
+
+> **注意**: 多 GPU 训练时，`--batch_size` 指定的是每个 GPU 的批次大小。
+> 例如 4 GPU + batch_size=64，总 effective batch size = 256。
+> 建议根据显存调整：单卡 24GB 可用 batch_size=64，16GB 用 32。
 
 **本地测试训练（仅可视化）：**
 
@@ -106,18 +111,17 @@ python train.py --num_epochs 10 --batch_size 32 --plot
 
 ## Webhook 通知
 
-支持使用 [apprise](https://github.com/caronc/apprise) 发送通知，兼容多种服务：
+使用 [Apprise API](https://github.com/caronc/apprise-api) 服务器发送通知，支持附件。
 
 ```bash
-# ntfy (推荐)
---webhook "ntfys://ntfy.example.com/topic"
+# Apprise API 服务器 (推荐，支持附件)
+--webhook "https://your-apprise-server.com/notify/your-key"
 
-# Telegram
---webhook "tgram://bot_token/chat_id"
-
-# Discord
---webhook "discord://webhook_id/webhook_token"
+# 示例
+--webhook "https://ntfy.jangit.me/notify/notifytg"
 ```
+
+> **说明**: URL 格式为 `https://host/notify/key`，直接通过 HTTP POST 发送通知和附件。
 
 环境变量: `DMTG_WEBHOOK_URL`
 

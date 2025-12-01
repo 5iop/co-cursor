@@ -2,7 +2,7 @@
 Webhook 通知工具
 使用 apprise 库发送通知，支持多种服务
 
-安装: pip install apprise
+安装: pip install apprise requests
 """
 import os
 import sys
@@ -11,12 +11,14 @@ import threading
 from pathlib import Path
 
 import apprise
+import requests
 
 
 # 默认配置（可通过环境变量或参数覆盖）
+# Apprise API 服务器地址
 DEFAULT_WEBHOOK_URL = os.environ.get(
     "DMTG_WEBHOOK_URL",
-    "ntfys://ntfy.jangit.me/notifytg"
+    "https://ntfy.jangit.me/notify/notifytg"
 )
 
 
@@ -40,29 +42,36 @@ def send_notification(
     """
     url = webhook_url or DEFAULT_WEBHOOK_URL
 
-    # 创建 Apprise 实例
-    apobj = apprise.Apprise()
-    apobj.add(url)
+    # 使用 requests 直接调用 Apprise API
+    try:
+        files = {}
+        data = {
+            "title": title,
+            "body": body,
+        }
 
-    # 准备附件
-    attach = None
-    if image_path and Path(image_path).exists():
-        attach = apprise.AppriseAttachment()
-        attach.add(image_path)
+        # 添加附件
+        if image_path and Path(image_path).exists():
+            files["attach"] = open(image_path, "rb")
 
-    # 发送通知
-    result = apobj.notify(
-        title=title,
-        body=body,
-        attach=attach,
-    )
+        if files:
+            response = requests.post(url, data=data, files=files)
+            # 关闭文件
+            for f in files.values():
+                f.close()
+        else:
+            response = requests.post(url, data=data)
 
-    if result:
-        print(f"[Notify] Sent: {title}")
-    else:
-        print(f"[Notify] Failed: {title}")
+        if response.status_code == 200:
+            print(f"[Notify] Sent: {title}")
+            return True
+        else:
+            print(f"[Notify] Failed: {title} (HTTP {response.status_code}: {response.text[:100]})")
+            return False
 
-    return result
+    except Exception as e:
+        print(f"[Notify] Error: {title} ({e})")
+        return False
 
 
 def send_training_update(

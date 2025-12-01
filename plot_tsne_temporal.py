@@ -34,10 +34,9 @@ import platform
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import apprise
-
 from src.models.alpha_ddim import create_alpha_ddim
 from src.data.dataset import CombinedMouseDataset, denormalize_dt
+from src.utils.notify import send_image_result
 
 
 def setup_chinese_font():
@@ -524,14 +523,14 @@ def main():
     # 发送 webhook
     if args.webhook:
         print("\n正在发送通知到 webhook...")
-        apobj = apprise.Apprise()
-        apobj.add(args.webhook)
-        success = apobj.notify(
+        success = send_image_result(
             title=f"DMTG Temporal t-SNE - {args.label or 'distribution'}",
-            body=f"Samples: {len(human_features)} human, {len(model_features)} generated",
-            attach=output_path,
+            image_path=output_path,
+            description=f"Samples: {len(human_features)} human, {len(model_features)} generated",
+            webhook_url=args.webhook,
         )
-        print("通知发送成功!" if success else "通知发送失败")
+        if not success:
+            print("通知发送失败")
 
 
 if __name__ == "__main__":

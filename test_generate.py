@@ -21,10 +21,9 @@ from pathlib import Path
 from datetime import datetime
 import platform
 
-import apprise
-
 from src.models.alpha_ddim import create_alpha_ddim, EntropyController
 from src.data.dataset import denormalize_dt
+from src.utils.notify import send_image_result
 
 # 设置中文字体
 def setup_chinese_font():
@@ -852,14 +851,14 @@ def main():
     # 发送 webhook 通知
     if args.webhook:
         print(f"\n正在发送通知到 webhook...")
-        apobj = apprise.Apprise()
-        apobj.add(args.webhook)
-        success = apobj.notify(
+        success = send_image_result(
             title=f"DMTG Generate - {args.label or 'test'}",
-            body=f"Alphas: {alphas}\nSamples: {len(all_results)}",
-            attach=str(save_path),
+            image_path=str(save_path),
+            description=f"Alphas: {alphas}\nSamples: {len(all_results)}",
+            webhook_url=args.webhook,
         )
-        print("通知发送成功!" if success else "通知发送失败")
+        if not success:
+            print("通知发送失败")
 
     # 加速度方向分布图 (论文 Fig.6)
     if args.acceleration_dist:
@@ -876,12 +875,11 @@ def main():
         )
         # 发送加速度分布图到 webhook
         if args.webhook:
-            apobj = apprise.Apprise()
-            apobj.add(args.webhook)
-            apobj.notify(
+            send_image_result(
                 title=f"DMTG Acceleration - {args.label or 'test'}",
-                body="Acceleration direction distribution (Fig.6)",
-                attach=str(accel_save_path),
+                image_path=str(accel_save_path),
+                description="Acceleration direction distribution (Fig.6)",
+                webhook_url=args.webhook,
             )
 
     print("完成!")
