@@ -11,7 +11,7 @@ install_deps() {
     echo "=========================================="
     sudo add-apt-repository -y ppa:savoury1/backports
     sudo apt-get update
-    sudo apt-get -y install aria2 vim
+    sudo apt-get -y install aria2 vim btop nvtop
     pip install -r requirements.txt
 }
 

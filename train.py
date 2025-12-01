@@ -528,8 +528,10 @@ class Trainer:
             # 更新学习率
             self.scheduler.step()
 
-            # 周期性训练进度通知
-            if self.webhook_url and self.epoch % self.notify_every == 0:
+            # 周期性训练进度通知（best model 已发送时跳过）
+            is_best_this_epoch = (self.val_loader and val_loss == self.best_loss) or \
+                                 (not self.val_loader and train_loss == self.best_loss)
+            if self.webhook_url and self.epoch % self.notify_every == 0 and not is_best_this_epoch:
                 current_loss = val_loss if self.val_loader else train_loss
                 send_training_update(
                     epoch=self.epoch,
