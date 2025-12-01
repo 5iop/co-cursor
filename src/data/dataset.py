@@ -49,7 +49,7 @@ class MouseTrajectoryDataset(Dataset):
         dataset_type: str = "boun_parquet",  # "boun_parquet", "open_images_parquet"
         max_length: int = 500,  # 论文中的 N，最大序列长度
         min_trajectory_length: int = 10,
-        min_straight_dist: float = 0.01,  # 最小起终点直线距离（归一化后）
+        min_straight_dist: float = 0.0,  # 最小起终点直线距离（默认关闭，数据已预处理）
         lazy: bool = False,  # 是否启用懒加载
     ):
         """
@@ -95,8 +95,7 @@ class MouseTrajectoryDataset(Dataset):
         else:
             raise ValueError(f"Unknown dataset type: {self.dataset_type}")
 
-        print(f"Loaded {len(self.trajectories)} trajectories from {self.dataset_type}"
-              f" (filtered {self._filtered_count} with straight_dist < {self.min_straight_dist})")
+        print(f"Loaded {len(self.trajectories)} trajectories from {self.dataset_type}")
 
     def _load_boun_parquet(self):
         """加载BOUN Parquet数据集（预处理后的格式）"""
@@ -107,67 +106,38 @@ class MouseTrajectoryDataset(Dataset):
             return
 
         if self.lazy:
-            # Lazy模式：扫描索引并过滤
+            # Lazy模式：直接记录索引，不做过滤（数据已预处理）
             print(f"Lazy loading BOUN Parquet from {parquet_file}...")
-            table = pq.read_table(parquet_file, columns=['x', 'y'])  # 读取x,y用于过滤
-            x_col = table.column('x')
-            y_col = table.column('y')
-
-            for i in range(len(table)):
-                x_list = x_col[i].as_py()
-                y_list = y_col[i].as_py()
-
-                # 检查最小轨迹长度
-                if len(x_list) < self.min_trajectory_length:
-                    continue
-
-                # 检查起终点直线距离 (仅 x, y)
-                straight_dist = np.sqrt(
-                    (x_list[-1] - x_list[0]) ** 2 + (y_list[-1] - y_list[0]) ** 2
-                )
-                if straight_dist < self.min_straight_dist:
-                    self._filtered_count += 1
-                    continue
-
+            table = pq.read_table(parquet_file, columns=['x'])  # 只读x获取行数
+            num_rows = len(table)
+            for i in range(num_rows):
                 self.trajectories.append((str(parquet_file), i))
-
-            print(f"Found {len(self.trajectories)} valid trajectories (lazy, filtered {self._filtered_count})")
+            print(f"Found {num_rows} trajectories (lazy)")
         else:
-            # Eager模式：加载全部数据到内存
+            # Eager模式：批量加载全部数据到内存
             print(f"Loading BOUN Parquet from {parquet_file}...")
 
             # 读取Parquet文件
             table = pq.read_table(parquet_file)
-
-            # 提取列数据
-            x_col = table.column('x')
-            y_col = table.column('y')
-            dt_col = table.column('dt') if 'dt' in table.column_names else None
-
             num_trajectories = len(table)
             print(f"Found {num_trajectories} trajectories in Parquet file")
 
-            for i in tqdm(range(num_trajectories), desc="Loading BOUN"):
-                x_list = x_col[i].as_py()
-                y_list = y_col[i].as_py()
+            # 批量转换为numpy数组（比逐行转换快很多）
+            x_arrays = table.column('x').to_pandas()
+            y_arrays = table.column('y').to_pandas()
+            dt_arrays = table.column('dt').to_pandas() if 'dt' in table.column_names else None
 
-                if len(x_list) < self.min_trajectory_length:
-                    continue
+            for i in tqdm(range(num_trajectories), desc="Loading BOUN"):
+                x_list = np.array(x_arrays[i], dtype=np.float32)
+                y_list = np.array(y_arrays[i], dtype=np.float32)
 
                 # 构建 (N, 3) 坐标数组: [x, y, dt_norm]
-                if dt_col is not None:
-                    dt_arr = np.array(dt_col[i].as_py(), dtype=np.float32)
+                if dt_arrays is not None:
+                    dt_arr = np.array(dt_arrays[i], dtype=np.float32)
                     dt_norm = normalize_dt(dt_arr)
-                    coords = np.column_stack([x_list, y_list, dt_norm]).astype(np.float32)
+                    coords = np.column_stack([x_list, y_list, dt_norm])
                 else:
-                    # 没有 dt 列时填充 0
-                    coords = np.column_stack([x_list, y_list, np.zeros(len(x_list))]).astype(np.float32)
-
-                # 过滤起终点距离过小的轨迹
-                straight_dist = self._compute_straight_dist(coords)
-                if straight_dist < self.min_straight_dist:
-                    self._filtered_count += 1
-                    continue
+                    coords = np.column_stack([x_list, y_list, np.zeros(len(x_list), dtype=np.float32)])
 
                 # 截断过长的轨迹
                 if len(coords) > self.max_length:
@@ -184,41 +154,23 @@ class MouseTrajectoryDataset(Dataset):
             return
 
         if self.lazy:
-            # Lazy模式：扫描索引并过滤
+            # Lazy模式：直接记录索引，不做过滤（数据已预处理）
             print(f"Lazy loading Open Images Parquet ({len(parquet_files)} files)...")
 
             for parquet_file in tqdm(parquet_files, desc="Scanning Parquet files"):
                 try:
-                    # 读取x,y用于过滤
-                    table = pq.read_table(parquet_file, columns=['x', 'y'])
+                    table = pq.read_table(parquet_file, columns=['x'])  # 只读x获取行数
                 except Exception as e:
                     print(f"  Error reading {parquet_file.name}: {e}")
                     continue
 
-                x_col = table.column('x')
-                y_col = table.column('y')
-
-                for i in range(len(table)):
-                    x_list = x_col[i].as_py()
-                    y_list = y_col[i].as_py()
-
-                    # 检查最小轨迹长度
-                    if len(x_list) < self.min_trajectory_length:
-                        continue
-
-                    # 检查起终点直线距离 (仅 x, y)
-                    straight_dist = np.sqrt(
-                        (x_list[-1] - x_list[0]) ** 2 + (y_list[-1] - y_list[0]) ** 2
-                    )
-                    if straight_dist < self.min_straight_dist:
-                        self._filtered_count += 1
-                        continue
-
+                num_rows = len(table)
+                for i in range(num_rows):
                     self.trajectories.append((str(parquet_file), i))
 
-            print(f"Found {len(self.trajectories)} valid trajectories (lazy, filtered {self._filtered_count})")
+            print(f"Found {len(self.trajectories)} trajectories (lazy)")
         else:
-            # Eager模式：加载全部数据到内存
+            # Eager模式：批量加载全部数据到内存
             print(f"Loading Open Images Parquet ({len(parquet_files)} files)...")
 
             for parquet_file in parquet_files:
@@ -228,31 +180,24 @@ class MouseTrajectoryDataset(Dataset):
                     print(f"  Error reading {parquet_file.name}: {e}")
                     continue
 
-                x_col = table.column('x')
-                y_col = table.column('y')
-                dt_col = table.column('dt') if 'dt' in table.column_names else None
+                num_rows = len(table)
 
-                # 每个文件单独的进度条
-                for i in tqdm(range(len(table)), desc=f"  {parquet_file.name}", leave=False):
-                    x_list = x_col[i].as_py()
-                    y_list = y_col[i].as_py()
+                # 批量转换为numpy数组（比逐行转换快很多）
+                x_arrays = table.column('x').to_pandas()
+                y_arrays = table.column('y').to_pandas()
+                dt_arrays = table.column('dt').to_pandas() if 'dt' in table.column_names else None
 
-                    if len(x_list) < self.min_trajectory_length:
-                        continue
+                for i in tqdm(range(num_rows), desc=f"  {parquet_file.name}", leave=False):
+                    x_list = np.array(x_arrays[i], dtype=np.float32)
+                    y_list = np.array(y_arrays[i], dtype=np.float32)
 
                     # 构建 (N, 3) 坐标数组: [x, y, dt_norm]
-                    if dt_col is not None:
-                        dt_arr = np.array(dt_col[i].as_py(), dtype=np.float32)
+                    if dt_arrays is not None:
+                        dt_arr = np.array(dt_arrays[i], dtype=np.float32)
                         dt_norm = normalize_dt(dt_arr)
-                        coords = np.column_stack([x_list, y_list, dt_norm]).astype(np.float32)
+                        coords = np.column_stack([x_list, y_list, dt_norm])
                     else:
-                        coords = np.column_stack([x_list, y_list, np.zeros(len(x_list))]).astype(np.float32)
-
-                    # 过滤起终点距离过小的轨迹
-                    straight_dist = self._compute_straight_dist(coords)
-                    if straight_dist < self.min_straight_dist:
-                        self._filtered_count += 1
-                        continue
+                        coords = np.column_stack([x_list, y_list, np.zeros(len(x_list), dtype=np.float32)])
 
                     # 截断过长的轨迹
                     if len(coords) > self.max_length:
@@ -260,7 +205,7 @@ class MouseTrajectoryDataset(Dataset):
 
                     self.trajectories.append((coords, len(coords)))
 
-                print(f"  {parquet_file.name}: {len(table)} records loaded")
+                print(f"  {parquet_file.name}: {num_rows} records loaded")
 
     def _pad_trajectory(self, coords: np.ndarray, length: int) -> Tuple[np.ndarray, np.ndarray]:
         """将轨迹padding到max_length，coords 为 (N, 3)"""
@@ -347,7 +292,7 @@ class CombinedMouseDataset(Dataset):
         open_images_dir: Optional[str] = None,
         max_length: int = 500,
         max_samples: Optional[int] = None,
-        min_straight_dist: float = 0.01,
+        min_straight_dist: float = 0.0,
         lazy: bool = False,
     ):
         self.max_length = max_length
@@ -475,7 +420,7 @@ def create_dataloader(
     max_samples: int = None,
     val_split: float = 0.1,
     return_val: bool = True,
-    min_straight_dist: float = 0.01,
+    min_straight_dist: float = 0.0,
     lazy: bool = False,
 ) -> Tuple[DataLoader, Optional[DataLoader]]:
     """
