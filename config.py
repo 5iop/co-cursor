@@ -9,20 +9,18 @@ from typing import Tuple, List, Optional
 @dataclass
 class DataConfig:
     """数据配置"""
-    sapimouse_dir: str = "datasets/sapimouse"
     boun_dir: str = "datasets/boun-processed"
     open_images_dir: str = "datasets/open_images_v6"
     seq_length: int = 500
     screen_size: Tuple[int, int] = (1920, 1080)
     min_trajectory_length: int = 10
-    normalize: bool = True
 
 
 @dataclass
 class ModelConfig:
     """模型配置"""
     # U-Net参数
-    base_channels: int = 64
+    base_channels: int = 128  # 方案B: 64→128, 参数量 4.7M→17M
     channel_mults: Tuple[int, ...] = (1, 2, 4)
     time_emb_dim: int = 128
     condition_dim: int = 4  # start(2) + end(2)
@@ -35,7 +33,7 @@ class ModelConfig:
 
     # 输入参数
     seq_length: int = 500
-    input_dim: int = 2
+    input_dim: int = 3  # x, y, dt
 
 
 @dataclass

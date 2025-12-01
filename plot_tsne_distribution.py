@@ -33,9 +33,10 @@ import platform
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import apprise
+
 from src.models.alpha_ddim import create_alpha_ddim
 from src.data.dataset import CombinedMouseDataset
-from src.utils.notify import send_image_result
 
 
 def setup_chinese_font():
@@ -55,16 +56,19 @@ def extract_trajectory_features(trajectory: np.ndarray) -> np.ndarray:
     从轨迹中提取特征向量
 
     Args:
-        trajectory: (seq_len, 2) 轨迹坐标
+        trajectory: (seq_len, 2) 或 (seq_len, 3) 轨迹坐标，支持 [x, y] 或 [x, y, dt]
 
     Returns:
         features: (n_features,) 特征向量
     """
+    # 只使用 x, y 进行几何特征提取
+    traj_xy = trajectory[:, :2]
+
     # 移除零填充
-    non_zero_mask = ~np.all(trajectory == 0, axis=1)
+    non_zero_mask = ~np.all(traj_xy == 0, axis=1)
     if non_zero_mask.sum() < 2:
         return None
-    traj = trajectory[non_zero_mask]
+    traj = traj_xy[non_zero_mask]
 
     if len(traj) < 3:
         return None
@@ -146,7 +150,6 @@ def extract_trajectory_features(trajectory: np.ndarray) -> np.ndarray:
 def load_human_trajectories(
     boun_dir: str = None,
     open_images_dir: str = None,
-    sapimouse_dir: str = None,
     max_samples: int = 1000,
 ) -> tuple:
     """
@@ -155,29 +158,24 @@ def load_human_trajectories(
     Args:
         boun_dir: BOUN 数据集目录
         open_images_dir: Open Images 数据集目录
-        sapimouse_dir: SapiMouse 数据集目录
         max_samples: 最大样本数
 
     Returns:
         features: (N, n_features) 特征数组
-        sources: (N,) 每个样本的来源标签 ('boun', 'open_images', 'sapimouse')
+        sources: (N,) 每个样本的来源标签 ('boun', 'open_images')
     """
     print(f"Loading human trajectories...")
     if boun_dir:
         print(f"  BOUN: {boun_dir}")
     if open_images_dir:
         print(f"  Open Images: {open_images_dir}")
-    if sapimouse_dir:
-        print(f"  SapiMouse: {sapimouse_dir}")
 
     # 检查目录是否存在
     boun_path = Path(boun_dir) if boun_dir else None
     open_images_path = Path(open_images_dir) if open_images_dir else None
-    sapimouse_path = Path(sapimouse_dir) if sapimouse_dir else None
 
     # 使用 lazy=True 避免一次性加载所有数据到内存
     dataset = CombinedMouseDataset(
-        sapimouse_dir=str(sapimouse_path) if sapimouse_path and sapimouse_path.exists() else None,
         boun_dir=str(boun_path) if boun_path and boun_path.exists() else None,
         open_images_dir=str(open_images_path) if open_images_path and open_images_path.exists() else None,
         max_length=500,
@@ -428,7 +426,6 @@ def plot_tsne_distribution(
     human_source_colors = {
         'boun': '#2E86AB',        # 蓝色
         'open_images': '#28A745', # 绿色
-        'sapimouse': '#6F42C1',   # 紫色
         'unknown': '#6C757D',     # 灰色
     }
     # 模型 alpha 颜色映射 (Paper A: α >= 1, 使用高区分度的颜色)
@@ -531,8 +528,6 @@ def main():
                        help="BOUN trajectory data directory")
     parser.add_argument("--open_images_data", type=str, default="datasets/open_images_v6",
                        help="Open Images trajectory data directory")
-    parser.add_argument("--sapimouse_data", type=str, default="datasets/sapimouse",
-                       help="SapiMouse trajectory data directory")
     parser.add_argument("--num_human", type=int, default=500,
                        help="Number of human samples")
     parser.add_argument("--num_model", type=int, default=500,
@@ -577,7 +572,7 @@ def main():
 
     # 加载模型
     print("\nLoading model...")
-    model = create_alpha_ddim(seq_length=500, timesteps=1000, device=args.device)
+    model = create_alpha_ddim(seq_length=500, timesteps=1000, input_dim=3, device=args.device)
 
     checkpoint_path = Path(args.checkpoint)
     if checkpoint_path.exists():
@@ -598,12 +593,10 @@ def main():
     boun_data_dir = args.human_data if args.human_data else args.boun_data
     boun_path = base_dir / boun_data_dir if boun_data_dir else None
     open_images_path = base_dir / args.open_images_data if args.open_images_data else None
-    sapimouse_path = base_dir / args.sapimouse_data if args.sapimouse_data else None
 
     human_features, human_sources = load_human_trajectories(
         boun_dir=str(boun_path) if boun_path else None,
         open_images_dir=str(open_images_path) if open_images_path else None,
-        sapimouse_dir=str(sapimouse_path) if sapimouse_path else None,
         max_samples=args.num_human,
     )
 
@@ -631,16 +624,14 @@ def main():
     # 发送 webhook 通知
     if args.webhook:
         print("\n正在发送通知到 webhook...")
-        success = send_image_result(
+        apobj = apprise.Apprise()
+        apobj.add(args.webhook)
+        success = apobj.notify(
             title=f"DMTG t-SNE - {args.label or 'distribution'}",
-            image_path=str(output_path),
-            description=f"Human: {args.num_human}, Model: {args.num_model}\nAlphas: {args.alphas}",
-            webhook_url=args.webhook,
+            body=f"Human: {args.num_human}, Model: {args.num_model}\nAlphas: {args.alphas}",
+            attach=str(output_path),
         )
-        if success:
-            print("通知发送成功!")
-        else:
-            print("通知发送失败")
+        print("通知发送成功!" if success else "通知发送失败")
 
     print("\nDone!")
 

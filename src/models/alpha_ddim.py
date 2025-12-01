@@ -41,7 +41,7 @@ class AlphaDDIM(nn.Module):
         timesteps: int = 1000,
         beta_schedule: str = "cosine",
         seq_length: int = 500,
-        input_dim: int = 2,
+        input_dim: int = 3,  # x, y, dt
     ):
         super().__init__()
         self.model = model
@@ -131,15 +131,15 @@ class AlphaDDIM(nn.Module):
         - α = 1 (直线) → α' = 0 → 100% 方向噪声
         - α → ∞ (复杂) → α' → 1 → 100% 各向同性噪声
 
-        论文 Eq.4: Σ_d = k_c · ||d|| · (d̂ ⊗ d̂)  -- 方向协方差 (秩1矩阵)
-        论文 Eq.5: Σ_n = σ²_n · I              -- 各向同性协方差
-        论文 Eq.6: Σ = (1-α')·Σ_d + α'·Σ_n    -- 混合协方差
+        论文 Eq.4: Σ_d = (k_c·||d||)² · (d̂ ⊗ d̂)  -- 方向协方差 (秩1矩阵)
+        论文 Eq.5: z_d = σ_d · ε · d̂ 其中 σ_d = k_c·||d||  -- 方向噪声采样
+        论文 Eq.6: Σ = (1-α')·Σ_d + α'·Σ_n    -- 混合协方差 (Σ_n = σ²_n·I 各向同性)
 
         采样: z ~ N(0, Σ) ≈ √(1-α')·z_d + √α'·z_n
         其中 z_d ~ N(0, Σ_d), z_n ~ N(0, Σ_n)
 
         Args:
-            x_t: 当前时刻的噪声数据 (batch, seq_len, 2)
+            x_t: 当前时刻的噪声数据 (batch, seq_len, input_dim)
             t: 当前时间步
             t_prev: 上一个时间步
             condition: 条件（起点+终点）(batch, 4)
@@ -187,16 +187,21 @@ class AlphaDDIM(nn.Module):
         # 论文 Eq.4: z_d ~ N(0, Σ_d) 其中 Σ_d = (k_c·||d||)²·(d̂⊗d̂)
         # 方向协方差是秩1矩阵，标准差为 σ_d = k_c·||d||
         # 采样为: z_d = σ_d · ε_1 · d̂，其中 ε_1 ~ N(0, 1) 是标量
+        # 注意: 方向噪声仅适用于 x, y 维度，dt 维度使用各向同性噪声
         noise_scalar = torch.randn(batch_size, self.seq_length, 1, device=x_t.device)
         direction_unit_expanded = direction_unit.unsqueeze(1)  # (batch, 1, 2)
         # 标准差 σ_d = k_c · ||d|| (从协方差 Σ_d = σ_d² · (d̂⊗d̂) 得到)
         sigma_d = (kc * direction_norm).unsqueeze(1)  # (batch, 1, 1)
-        z_d = sigma_d * noise_scalar * direction_unit_expanded  # (batch, seq, 2)
+        z_d_xy = sigma_d * noise_scalar * direction_unit_expanded  # (batch, seq, 2) 仅 x, y
 
-        # 论文 Eq.4: z_ε ~ N(0, Σ_ε) 其中 Σ_ε = (k_c·||d||)²·I
-        # 各向同性协方差，但标准差 σ_ε = k_c·||d|| (不是1!)
+        # 各向同性噪声 (x, y 维度): z_n_xy ~ N(0, Σ_n) 其中 Σ_n = (k_c·||d||)²·I
+        # 标准差 σ_n = k_c·||d|| (与方向噪声使用相同的缩放因子)
         sigma_epsilon = (kc * direction_norm).unsqueeze(1)  # (batch, 1, 1)
-        z_n = sigma_epsilon * torch.randn_like(x_t)  # (batch, seq, 2), cov = (k_c·||d||)²·I
+        z_n_xy = sigma_epsilon * torch.randn(batch_size, self.seq_length, 2, device=x_t.device)
+
+        # 各向同性噪声 (dt 维度): 使用标准高斯 σ=1，因为 dt 已归一化到 [0,1]
+        # 注意: dt 与空间距离无关，不应使用距离缩放
+        z_n_dt = torch.randn(batch_size, self.seq_length, self.input_dim - 2, device=x_t.device) if self.input_dim > 2 else None
 
         # 论文 Eq.6: 混合协方差采样
         # 将 α ∈ [1, +∞) 转换为混合系数 a ∈ [0, 1)
@@ -208,7 +213,12 @@ class AlphaDDIM(nn.Module):
         # z ~ N(0, (1-a)Σ_d + a·Σ_ε) ≈ √(1-a)·z_d + √a·z_n
         sqrt_dir = np.sqrt(1 - mixing_coef)    # 方向噪声权重
         sqrt_iso = np.sqrt(mixing_coef)        # 各向同性噪声权重
-        z_mixed = sqrt_dir * z_d + sqrt_iso * z_n
+
+        # 组合噪声: x, y 维度使用混合噪声，dt 维度仅使用各向同性噪声
+        z_mixed = torch.zeros_like(x_t)  # (batch, seq, input_dim)
+        z_mixed[:, :, :2] = sqrt_dir * z_d_xy + sqrt_iso * z_n_xy  # x, y: 混合噪声 (距离缩放)
+        if self.input_dim > 2 and z_n_dt is not None:
+            z_mixed[:, :, 2:] = z_n_dt  # dt: 标准高斯噪声 (σ=1，无距离缩放)
 
         # 应用总噪声: σ_t 来自 DDIM，z_mixed 来自混合协方差
         sigma_t = sigma_base
@@ -256,7 +266,7 @@ class AlphaDDIM(nn.Module):
                         如果为 True 且 effective_length 为 None，则自动预测长度
 
         Returns:
-            生成的轨迹 (batch, seq_length, 2)
+            生成的轨迹 (batch, seq_length, input_dim)
             如果 effective_length < seq_length，后面的点为零填充
         """
         self.model.eval()
@@ -273,10 +283,11 @@ class AlphaDDIM(nn.Module):
             if hasattr(self.model, 'length_head') and self.model.length_head is not None:
                 # 构建 alpha tensor
                 alpha_tensor = torch.full((batch_size,), alpha_clamped, device=device, dtype=torch.float32)
-                # 创建初始输入 (t=0 时刻的噪声轨迹) 用于 Shared Encoder 长度预测
+                # 创建初始输入 (纯高斯噪声，对应 t=T) 用于 Shared Encoder 长度预测
                 x_init = torch.randn(batch_size, self.seq_length, self.input_dim, device=device)
-                # 预测长度
-                log_length = self.model.predict_length(x_init, condition, alpha_tensor)
+                # 预测长度 - 传入 t=T-1 (最大时间步索引)，让 Encoder 知道这是纯噪声
+                t_max = torch.full((batch_size,), self.timesteps - 1, device=device, dtype=torch.long)
+                log_length = self.model.predict_length(x_init, condition, alpha_tensor, time=t_max)
                 predicted_lengths = self.model.decode_length(log_length, max_length=self.seq_length)
                 # 使用 per-sample 长度
                 effective_length = predicted_lengths
@@ -419,13 +430,13 @@ class AlphaDDIM(nn.Module):
         sigma_epsilon = k_c * distance  # (batch, 1)
         sigma_epsilon = sigma_epsilon.unsqueeze(2)  # (batch, 1, 1) for broadcasting
 
-        # 创建掩码 M (论文 Eq.2)
+        # 创建掩码 M (论文 Eq.2) - 仅对 x, y 维度有效
         mask = torch.zeros(batch_size, self.seq_length, 1, device=device)
         mask[:, 0, :] = 1.0   # 起点掩码
 
-        # 创建条件值 X_c
+        # 创建条件值 X_c (仅设置 x, y 维度，dt 维度为 0)
         x_c = torch.zeros(batch_size, self.seq_length, self.input_dim, device=device)
-        x_c[:, 0, :] = start_point   # 起点
+        x_c[:, 0, :2] = start_point   # 起点 (仅 x, y)
 
         if is_per_sample:
             # Per-sample: 使用 scatter_ 设置每个样本的终点位置
@@ -433,26 +444,30 @@ class AlphaDDIM(nn.Module):
             # 为 mask 设置终点
             end_indices_mask = end_indices.view(batch_size, 1, 1)  # (batch, 1, 1)
             mask.scatter_(1, end_indices_mask, 1.0)
-            # 为 x_c 设置终点
-            end_indices_xc = end_indices.view(batch_size, 1, 1).expand(-1, 1, self.input_dim)  # (batch, 1, 2)
-            x_c.scatter_(1, end_indices_xc, end_point.unsqueeze(1))
+            # 为 x_c 设置终点 (仅 x, y 维度)
+            end_indices_xc = end_indices.view(batch_size, 1, 1).expand(-1, 1, 2)  # (batch, 1, 2)
+            x_c[:, :, :2].scatter_(1, end_indices_xc, end_point.unsqueeze(1))
         elif effective_length is not None and effective_length < self.seq_length:
             # 统一 int 长度
             end_idx = effective_length - 1
             mask[:, end_idx, :] = 1.0
-            x_c[:, end_idx, :] = end_point
+            x_c[:, end_idx, :2] = end_point  # 仅 x, y
         else:
             # 默认: 终点在最后
             mask[:, -1, :] = 1.0
-            x_c[:, -1, :] = end_point
+            x_c[:, -1, :2] = end_point  # 仅 x, y
 
-        # 生成距离缩放的高斯噪声 ε
+        # 生成距离缩放的高斯噪声 ε (全维度)
         noise = torch.randn(batch_size, self.seq_length, self.input_dim, device=device)
-        scaled_noise = noise * sigma_epsilon  # (batch, seq_len, 2)
+        scaled_noise = noise * sigma_epsilon  # (batch, seq_len, input_dim)
 
         # 论文 Eq.3: 中间点初始化为 p_c + ε (中点 + 噪声)
+        # x, y 维度: 中点 + 噪声; dt 维度: 纯噪声
+        middle_points = torch.zeros(batch_size, self.seq_length, self.input_dim, device=device)
         midpoint_expanded = midpoint.unsqueeze(1).expand(-1, self.seq_length, -1)  # (batch, seq_len, 2)
-        middle_points = midpoint_expanded + scaled_noise  # (batch, seq_len, 2)
+        middle_points[:, :, :2] = midpoint_expanded + scaled_noise[:, :, :2]  # x, y: 中点 + 噪声
+        if self.input_dim > 2:
+            middle_points[:, :, 2:] = scaled_noise[:, :, 2:]  # dt: 纯噪声 (将被后续处理)
 
         # 创建 padding mask (有效部分为1，padding部分为0)
         if is_per_sample:
@@ -500,33 +515,33 @@ class AlphaDDIM(nn.Module):
         # 处理 effective_length 的不同类型
         is_per_sample = isinstance(effective_length, torch.Tensor)
 
-        # 创建掩码 M
+        # 创建掩码 M (仅对 x, y 维度有效，dt 维度不约束)
         mask = torch.zeros_like(x)
-        mask[:, 0, :] = 1.0  # 起点
+        mask[:, 0, :2] = 1.0  # 起点 (仅 x, y)
 
-        # 创建条件值 X_c
-        x_c = torch.zeros_like(x)
-        x_c[:, 0, :] = start_point
+        # 创建条件值 X_c (仅设置 x, y 维度)
+        x_c = x.clone()  # 复制原始轨迹，保留 dt 值
+        x_c[:, 0, :2] = start_point  # 起点 (仅 x, y)
 
         if is_per_sample:
             # Per-sample: 使用 scatter_ 设置每个样本的终点
             lengths = effective_length.long().to(device)
             end_indices = (lengths - 1).clamp(0, self.seq_length - 1)  # (batch,)
-            # 为 mask 设置终点
-            end_indices_mask = end_indices.view(batch_size, 1, 1).expand(-1, 1, self.input_dim)
-            mask.scatter_(1, end_indices_mask, 1.0)
-            # 为 x_c 设置终点
-            x_c.scatter_(1, end_indices_mask, end_point.unsqueeze(1))
+            # 为 mask 设置终点 (仅 x, y 维度)
+            end_indices_mask = end_indices.view(batch_size, 1, 1).expand(-1, 1, 2)
+            mask[:, :, :2].scatter_(1, end_indices_mask, 1.0)
+            # 为 x_c 设置终点 (仅 x, y 维度)
+            x_c[:, :, :2].scatter_(1, end_indices_mask, end_point.unsqueeze(1))
         elif effective_length is not None and effective_length < self.seq_length:
             end_idx = effective_length - 1
-            mask[:, end_idx, :] = 1.0
-            x_c[:, end_idx, :] = end_point
+            mask[:, end_idx, :2] = 1.0  # 仅 x, y
+            x_c[:, end_idx, :2] = end_point  # 仅 x, y
         else:
             end_idx = self.seq_length - 1
-            mask[:, end_idx, :] = 1.0
-            x_c[:, end_idx, :] = end_point
+            mask[:, end_idx, :2] = 1.0  # 仅 x, y
+            x_c[:, end_idx, :2] = end_point  # 仅 x, y
 
-        # 应用掩码: x' = M ⊙ X_c + (1-M) ⊙ x
+        # 应用掩码: x' = M ⊙ X_c + (1-M) ⊙ x (dt 维度不受影响因为 mask 为 0)
         x = mask * x_c + (1 - mask) * x
 
         return x
@@ -635,7 +650,7 @@ class AlphaDDIM(nn.Module):
 
         Returns:
             (trajectories, predicted_lengths)
-            - trajectories: (batch, seq_length, 2) 生成的轨迹
+            - trajectories: (batch, seq_length, input_dim) 生成的轨迹
             - predicted_lengths: (batch,) 每个样本的预测长度
         """
         # 检查模型是否支持长度预测
@@ -685,10 +700,10 @@ class AlphaDDIM(nn.Module):
     ) -> torch.Tensor:
         """
         应用边界条件：确保轨迹的起点和终点与条件匹配
-        使用平滑插值避免突变
+        使用平滑插值避免突变 (仅对 x, y 维度)
 
         Args:
-            trajectory: (batch, seq_len, 2)
+            trajectory: (batch, seq_len, input_dim)
             condition: (batch, 4) - [start_x, start_y, end_x, end_y]
             effective_length: 有效轨迹长度，支持:
                 - None: 处理整个 seq_length
@@ -703,6 +718,9 @@ class AlphaDDIM(nn.Module):
         # 处理 effective_length 的不同类型
         is_per_sample = isinstance(effective_length, torch.Tensor)
 
+        # 复制轨迹，仅修改 x, y 维度
+        result = trajectory.clone()
+
         if is_per_sample:
             # Per-sample: 每个样本有不同的长度
             lengths = effective_length.long().to(device)  # (batch,)
@@ -713,17 +731,17 @@ class AlphaDDIM(nn.Module):
             weights = seq_indices / (lengths_float - 1).clamp(min=1)  # (batch, seq_length)
             weights = weights.clamp(0, 1).unsqueeze(2)  # (batch, seq_length, 1)
 
-            # 获取当前起点
-            current_start = trajectory[:, 0:1, :]  # (batch, 1, 2)
+            # 获取当前起点 (仅 x, y)
+            current_start_xy = trajectory[:, 0:1, :2]  # (batch, 1, 2)
 
-            # 获取每个样本的当前终点 (使用 gather)
+            # 获取每个样本的当前终点 (仅 x, y)
             end_indices = (lengths - 1).clamp(0, self.seq_length - 1)  # (batch,)
-            end_indices_expanded = end_indices.view(batch_size, 1, 1).expand(-1, 1, self.input_dim)
-            current_end = trajectory.gather(1, end_indices_expanded)  # (batch, 1, 2)
+            end_indices_expanded = end_indices.view(batch_size, 1, 1).expand(-1, 1, 2)
+            current_end_xy = trajectory[:, :, :2].gather(1, end_indices_expanded)  # (batch, 1, 2)
 
-            # 插值修正
-            start_correction = start_point.unsqueeze(1) - current_start  # (batch, 1, 2)
-            end_correction = end_point.unsqueeze(1) - current_end  # (batch, 1, 2)
+            # 插值修正 (仅 x, y)
+            start_correction = start_point.unsqueeze(1) - current_start_xy  # (batch, 1, 2)
+            end_correction = end_point.unsqueeze(1) - current_end_xy  # (batch, 1, 2)
 
             # 应用平滑修正 (只在有效区域)
             correction = start_correction * (1 - weights) + end_correction * weights  # (batch, seq_length, 2)
@@ -731,8 +749,8 @@ class AlphaDDIM(nn.Module):
             # 创建 padding mask
             padding_mask = (seq_indices < lengths_float).float().unsqueeze(2)  # (batch, seq_length, 1)
 
-            # 只对有效部分应用修正
-            result = trajectory + correction * padding_mask
+            # 只对 x, y 维度应用修正
+            result[:, :, :2] = trajectory[:, :, :2] + correction * padding_mask
 
             return result
 
@@ -744,28 +762,22 @@ class AlphaDDIM(nn.Module):
             weights = torch.linspace(0, 1, m, device=device)
             weights = weights.view(1, -1, 1).expand(batch_size, -1, 2)
 
-            # 获取有效部分
-            traj_valid = trajectory[:, :m, :]
+            # 获取有效部分的 x, y
+            traj_valid_xy = trajectory[:, :m, :2]
 
-            # 计算当前起点和终点的偏移
-            current_start = traj_valid[:, 0:1, :]
-            current_end = traj_valid[:, -1:, :]
+            # 计算当前起点和终点的偏移 (仅 x, y)
+            current_start_xy = traj_valid_xy[:, 0:1, :]
+            current_end_xy = traj_valid_xy[:, -1:, :]
 
             # 插值修正
-            start_correction = start_point.unsqueeze(1) - current_start
-            end_correction = end_point.unsqueeze(1) - current_end
+            start_correction = start_point.unsqueeze(1) - current_start_xy
+            end_correction = end_point.unsqueeze(1) - current_end_xy
 
             # 应用平滑修正
             correction = start_correction * (1 - weights) + end_correction * weights
-            traj_valid = traj_valid + correction
+            result[:, :m, :2] = traj_valid_xy + correction
 
-            # 保留原轨迹的零填充部分
-            if m < self.seq_length:
-                result = trajectory.clone()
-                result[:, :m, :] = traj_valid
-                return result
-            else:
-                return traj_valid
+            return result
 
         else:
             # 默认: 处理整个 seq_length
@@ -775,17 +787,19 @@ class AlphaDDIM(nn.Module):
             weights = torch.linspace(0, 1, m, device=device)
             weights = weights.view(1, -1, 1).expand(batch_size, -1, 2)
 
-            # 计算当前起点和终点的偏移
-            current_start = trajectory[:, 0:1, :]
-            current_end = trajectory[:, -1:, :]
+            # 计算当前起点和终点的偏移 (仅 x, y)
+            current_start_xy = trajectory[:, 0:1, :2]
+            current_end_xy = trajectory[:, -1:, :2]
 
             # 插值修正
-            start_correction = start_point.unsqueeze(1) - current_start
-            end_correction = end_point.unsqueeze(1) - current_end
+            start_correction = start_point.unsqueeze(1) - current_start_xy
+            end_correction = end_point.unsqueeze(1) - current_end_xy
 
-            # 应用平滑修正
+            # 应用平滑修正 (仅 x, y)
             correction = start_correction * (1 - weights) + end_correction * weights
-            return trajectory + correction
+            result[:, :, :2] = trajectory[:, :, :2] + correction
+
+            return result
 
     def get_loss(
         self,
@@ -801,7 +815,7 @@ class AlphaDDIM(nn.Module):
         计算训练损失
 
         Args:
-            x_0: 原始轨迹 (batch, seq_len, 2)
+            x_0: 原始轨迹 (batch, seq_len, input_dim)
             condition: 条件 (batch, 4) - 起点+终点
             t: 时间步 (batch,)
             alpha: 复杂度参数 (batch,) - 从轨迹计算得到
@@ -863,6 +877,7 @@ class AlphaDDIM(nn.Module):
         从轨迹计算复杂度参数α (论文方案A)
 
         α = path_length / straight_distance (ratio)
+        注意: 仅使用 x, y 维度计算，忽略 dt
 
         论文语义:
         - α = 1: 直线轨迹（最简单）
@@ -870,7 +885,7 @@ class AlphaDDIM(nn.Module):
         - 论文推荐范围: α ∈ [1, ~10]，实验用 [0.3, 0.8] 经 1/(α+1) 变换后
 
         Args:
-            trajectory: (batch, seq_len, 2)
+            trajectory: (batch, seq_len, input_dim), 仅使用前两维 (x, y)
             mask: (batch, seq_len) 有效位置掩码，1表示有效，0表示padding
 
         Returns:
@@ -879,12 +894,15 @@ class AlphaDDIM(nn.Module):
         batch_size = trajectory.shape[0]
         device = trajectory.device
 
+        # 仅使用 x, y 维度计算路径长度
+        traj_xy = trajectory[:, :, :2]  # (batch, seq_len, 2)
+
         if mask is None:
             # 无mask时假设全部有效（向后兼容）
-            segments = trajectory[:, 1:, :] - trajectory[:, :-1, :]
+            segments = traj_xy[:, 1:, :] - traj_xy[:, :-1, :]
             path_length = torch.norm(segments, dim=-1).sum(dim=-1)
             straight_dist = torch.norm(
-                trajectory[:, -1, :] - trajectory[:, 0, :], dim=-1
+                traj_xy[:, -1, :] - traj_xy[:, 0, :], dim=-1
             ) + 1e-8
         else:
             # 使用mask计算真实的路径长度和终点
@@ -895,8 +913,8 @@ class AlphaDDIM(nn.Module):
             # segment_mask[i] = mask[i] AND mask[i+1]
             segment_mask = mask[:, :-1] * mask[:, 1:]  # (batch, seq_len-1)
 
-            # 计算所有段
-            segments = trajectory[:, 1:, :] - trajectory[:, :-1, :]  # (batch, seq_len-1, 2)
+            # 计算所有段 (仅 x, y)
+            segments = traj_xy[:, 1:, :] - traj_xy[:, :-1, :]  # (batch, seq_len-1, 2)
             segment_lengths = torch.norm(segments, dim=-1)  # (batch, seq_len-1)
 
             # 只累加有效段
@@ -906,10 +924,10 @@ class AlphaDDIM(nn.Module):
             # 终点索引是 lengths - 1
             end_indices = (lengths - 1).clamp(min=0)  # (batch,)
             end_indices = end_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, 2)  # (batch, 1, 2)
-            end_points = trajectory.gather(1, end_indices).squeeze(1)  # (batch, 2)
+            end_points = traj_xy.gather(1, end_indices).squeeze(1)  # (batch, 2)
 
             # 起点
-            start_points = trajectory[:, 0, :]  # (batch, 2)
+            start_points = traj_xy[:, 0, :]  # (batch, 2)
 
             # 计算直线距离
             straight_dist = torch.norm(end_points - start_points, dim=-1) + 1e-8  # (batch,)
@@ -987,7 +1005,7 @@ class EntropyController:
         其中 C = log(2πe) - log(β) 是常数
 
         Args:
-            trajectory: (batch, seq_len, 2)
+            trajectory: (batch, seq_len, input_dim), 仅使用 x, y 计算
 
         Returns:
             entropy: (batch,) MST 熵估计值
@@ -996,7 +1014,9 @@ class EntropyController:
         m = float(seq_len)
 
         # Eq.8: 计算路径总长度 L_path = Σ||p_i - p_{i+1}||
-        segments = trajectory[:, 1:, :] - trajectory[:, :-1, :]
+        # 只使用 x, y 维度计算路径长度
+        traj_xy = trajectory[:, :, :2]
+        segments = traj_xy[:, 1:, :] - traj_xy[:, :-1, :]
         path_length = torch.norm(segments, dim=-1).sum(dim=-1)  # (batch,)
 
         # 避免 log(0)
@@ -1014,17 +1034,21 @@ class EntropyController:
         计算 MST 比率 (简化复杂度度量)
 
         ratio = path_length / straight_distance
+        注意: 只使用 x, y 维度计算
 
         Returns:
             ratio: (batch,) MST 比率
         """
+        # 只使用 x, y 维度计算
+        traj_xy = trajectory[:, :, :2]
+
         # 计算路径长度
-        segments = trajectory[:, 1:, :] - trajectory[:, :-1, :]
+        segments = traj_xy[:, 1:, :] - traj_xy[:, :-1, :]
         path_length = torch.norm(segments, dim=-1).sum(dim=-1)  # (batch,)
 
         # 计算起点到终点的直线距离
         straight_distance = torch.norm(
-            trajectory[:, -1, :] - trajectory[:, 0, :],
+            traj_xy[:, -1, :] - traj_xy[:, 0, :],
             dim=-1
         ) + 1e-8  # (batch,)
 
@@ -1112,13 +1136,14 @@ class EntropyController:
 def create_alpha_ddim(
     seq_length: int = 500,
     timesteps: int = 1000,
-    base_channels: int = 64,
+    base_channels: int = 128,  # 方案B: 64→128
+    input_dim: int = 3,  # x, y, dt
     device: str = "cuda",
 ) -> AlphaDDIM:
     """创建α-DDIM模型"""
     unet = TrajectoryUNet(
         seq_length=seq_length,
-        input_dim=2,
+        input_dim=input_dim,
         base_channels=base_channels,
     )
 
@@ -1126,7 +1151,7 @@ def create_alpha_ddim(
         model=unet,
         timesteps=timesteps,
         seq_length=seq_length,
-        input_dim=2,
+        input_dim=input_dim,
     )
 
     return model.to(device)
@@ -1137,11 +1162,12 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    model = create_alpha_ddim(seq_length=500, device=device)
+    model = create_alpha_ddim(seq_length=500, input_dim=3, device=device)
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # 测试前向传播
     batch_size = 4
-    x_0 = torch.randn(batch_size, 500, 2, device=device)
+    x_0 = torch.randn(batch_size, 500, 3, device=device)  # x, y, dt
     condition = torch.randn(batch_size, 4, device=device)
 
     losses = model.get_loss(x_0, condition)
@@ -1156,4 +1182,4 @@ if __name__ == "__main__":
         alpha=1.5,
         device=device
     )
-    print(f"Generated trajectory shape: {samples.shape}")
+    print(f"Generated trajectory shape: {samples.shape}")  # (2, 500, 3)

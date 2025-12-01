@@ -228,7 +228,8 @@ class Trainer:
             predicted_log_length = None
             unet = self.model_raw.model.module if self.distributed else self.model_raw.model
             if hasattr(unet, 'length_head') and unet.length_head is not None:
-                predicted_log_length = unet.predict_length(x_t, condition, alpha)
+                # 传入实际时间步 t，让 Shared Encoder 感知当前噪声水平
+                predicted_log_length = unet.predict_length(x_t, condition, alpha, time=t)
 
             # 使用DMTGLoss计算完整损失 (论文公式14 + 长度预测)
             # L = w1·LDDIM + w2·Lsim + w3·Lstyle + w4·Llength
@@ -317,7 +318,8 @@ class Trainer:
             predicted_log_length = None
             unet = self.model_raw.model.module if self.distributed else self.model_raw.model
             if hasattr(unet, 'length_head') and unet.length_head is not None:
-                predicted_log_length = unet.predict_length(x_t, condition, alpha)
+                # 传入实际时间步 t，让 Shared Encoder 感知当前噪声水平
+                predicted_log_length = unet.predict_length(x_t, condition, alpha, time=t)
 
             # 使用DMTGLoss计算完整损失 (论文公式14 + 长度预测)
             loss_dict = self.loss_fn(
@@ -389,71 +391,21 @@ class Trainer:
         if not is_main_process() or not self.plot:
             return
 
-        # 构建标签：训练开始时间_epoch
-        label = f"{self.training_start_time}_epoch{self.epoch}"
-        checkpoint_path = str(self.checkpoint_dir / "best_model.pt")
-        cwd = str(Path(__file__).parent)
+        try:
+            from src.utils.notify import run_visualization_scripts
 
-        def _run_tsne():
-            try:
-                cmd = [
-                    sys.executable,
-                    "plot_tsne_distribution.py",
-                    "-c", checkpoint_path,
-                    "-l", label,
-                    "--num_human", "300",
-                    "--num_model", "300",
-                    "--device", "cpu",
-                    "--no_display",
-                ]
-                if self.human_data_dir:
-                    cmd.extend(["--human_data", self.human_data_dir])
+            label = f"{self.training_start_time}_epoch{self.epoch}"
+            checkpoint_path = str(self.checkpoint_dir / "best_model.pt")
 
-                # 添加 webhook 参数
-                if self.webhook_url:
-                    cmd.extend(["--webhook", self.webhook_url])
-
-                print(f"[t-SNE] Starting background plot: {label}")
-                result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-
-                if result.returncode == 0:
-                    print(f"[t-SNE] Plot completed: {label}")
-                else:
-                    print(f"[t-SNE] Failed: {result.stderr[:200]}")
-            except Exception as e:
-                print(f"[t-SNE] Error: {e}")
-
-        def _run_generate():
-            try:
-                cmd = [
-                    sys.executable,
-                    "test_generate.py",
-                    "--checkpoint", checkpoint_path,
-                    "-l", label,
-                    "--num_samples", "3",
-                    "--device", "cpu",
-                    "--no_display",
-                ]
-
-                # 添加 webhook 参数
-                if self.webhook_url:
-                    cmd.extend(["--webhook", self.webhook_url])
-
-                print(f"[Generate] Starting background test: {label}")
-                result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-
-                if result.returncode == 0:
-                    print(f"[Generate] Test completed: {label}")
-                else:
-                    print(f"[Generate] Failed: {result.stderr[:200]}")
-            except Exception as e:
-                print(f"[Generate] Error: {e}")
-
-        # 启动两个后台线程
-        thread1 = threading.Thread(target=_run_tsne, daemon=True)
-        thread2 = threading.Thread(target=_run_generate, daemon=True)
-        thread1.start()
-        thread2.start()
+            run_visualization_scripts(
+                checkpoint_path=checkpoint_path,
+                label=label,
+                webhook_url=self.webhook_url,
+                human_data_dir=self.human_data_dir,
+                cwd=str(Path(__file__).parent),
+            )
+        except Exception as e:
+            print(f"[Visualization] Failed to start: {e}")
 
     def load_checkpoint(self, path: str, total_epochs: int = None):
         """
@@ -623,12 +575,6 @@ def parse_args():
 
     # 数据参数
     parser.add_argument(
-        "--sapimouse_dir",
-        type=str,
-        default="datasets/sapimouse",
-        help="SapiMouse数据集目录"
-    )
-    parser.add_argument(
         "--boun_dir",
         type=str,
         default="datasets/boun-processed",
@@ -657,7 +603,7 @@ def parse_args():
     parser.add_argument(
         "--base_channels",
         type=int,
-        default=64,
+        default=128,  # 方案B: 64→128, 参数量 4.7M→17M
         help="U-Net基础通道数"
     )
     parser.add_argument(
@@ -793,25 +739,21 @@ def main():
 
     # 检查数据集路径
     base_dir = Path(__file__).parent
-    sapimouse_dir = base_dir / args.sapimouse_dir
     boun_dir = base_dir / args.boun_dir if args.boun_dir else None
     open_images_dir = base_dir / args.open_images_dir if args.open_images_dir else None
 
-    sapimouse_path = str(sapimouse_dir) if sapimouse_dir.exists() else None
     boun_path = str(boun_dir) if boun_dir and boun_dir.exists() else None
     open_images_path = str(open_images_dir) if open_images_dir and open_images_dir.exists() else None
 
-    if sapimouse_path is None and boun_path is None and open_images_path is None:
+    if boun_path is None and open_images_path is None:
         if is_main_process():
             print("Error: No dataset found!")
-            print(f"  Checked: {sapimouse_dir}")
             print(f"  Checked: {boun_dir}")
             print(f"  Checked: {open_images_dir}")
         cleanup_distributed()
         return
 
     if is_main_process():
-        print(f"SapiMouse: {sapimouse_path or 'Not found'}")
         print(f"BOUN: {boun_path or 'Not found'}")
         print(f"Open Images: {open_images_path or 'Not found'}")
 
@@ -823,7 +765,6 @@ def main():
     # 先创建完整数据集
     from torch.utils.data import random_split
     dataset = CombinedMouseDataset(
-        sapimouse_dir=sapimouse_path,
         boun_dir=boun_path,
         open_images_dir=open_images_path,
         max_length=args.max_length,
@@ -885,7 +826,7 @@ def main():
 
     unet = TrajectoryUNet(
         seq_length=args.max_length,
-        input_dim=2,
+        input_dim=3,  # x, y, dt
         base_channels=args.base_channels,
         enable_length_prediction=enable_length_pred,
     )
@@ -894,7 +835,7 @@ def main():
         model=unet,
         timesteps=args.timesteps,
         seq_length=args.max_length,
-        input_dim=2,
+        input_dim=3,  # x, y, dt
     )
 
     if is_main_process():

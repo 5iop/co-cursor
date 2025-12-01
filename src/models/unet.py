@@ -34,9 +34,9 @@ class DiscreteAlphaEmbedding(nn.Module):
     s.t. α' = 1/(α+1)
 
     论文语义:
-    - α ∈ [0, +∞) 是复杂度参数
-    - α' = 1/(α+1) 将 α 映射到 (0, 1]
-    - α=0 → α'=1 (最简单), α→∞ → α'→0 (最复杂)
+    - α ∈ [1, +∞) 是复杂度参数 (path_ratio = path_length / straight_distance)
+    - α' = 1/α 将 α 映射到 (0, 1]
+    - α=1 → α'=1 (直线/最简单), α→∞ → α'→0 (最复杂)
     - bin = floor(α' * S)
 
     注意: 训练时 α = path_ratio ∈ [1, +∞)
@@ -104,19 +104,30 @@ class LengthPredictionHead(nn.Module):
         self,
         encoder_dim: int,      # encoder bottleneck 通道数
         condition_dim: int,    # 条件嵌入维度 (time_emb_dim)
-        hidden_dim: int = 128,
+        hidden_dim: int = 256,
+        num_layers: int = 5,   # MLP 层数
         output_dim: int = 1,
     ):
         super().__init__()
         # 输入: encoder_feature + condition_emb + alpha_emb
         input_dim = encoder_dim + condition_dim * 2
-        self.mlp = nn.Sequential(
+
+        layers = []
+        # 第一层: input_dim → hidden_dim
+        layers.extend([
             nn.Linear(input_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, output_dim),
-        )
+        ])
+        # 中间层: hidden_dim → hidden_dim
+        for _ in range(num_layers - 2):
+            layers.extend([
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+            ])
+        # 输出层: hidden_dim → output_dim
+        layers.append(nn.Linear(hidden_dim, output_dim))
+
+        self.mlp = nn.Sequential(*layers)
 
     def forward(
         self,
@@ -288,9 +299,9 @@ class TrajectoryUNet(nn.Module):
     轨迹生成U-Net
     用于预测扩散过程中的噪声
 
-    输入: (batch, seq_len, 2) - 噪声轨迹
+    输入: (batch, seq_len, 3) - 噪声轨迹 [x, y, dt]
     条件: 起点坐标、终点坐标、α (复杂度参数)
-    输出: (batch, seq_len, 2) - 预测噪声
+    输出: (batch, seq_len, 3) - 预测噪声
 
     论文公式10: ε_θ(x_t, t, c, α)
 
@@ -301,7 +312,7 @@ class TrajectoryUNet(nn.Module):
     def __init__(
         self,
         seq_length: int = 500,
-        input_dim: int = 2,
+        input_dim: int = 3,  # x, y, dt
         base_channels: int = 64,
         channel_mults: tuple = (1, 2, 4),
         time_emb_dim: int = 128,
@@ -349,7 +360,8 @@ class TrajectoryUNet(nn.Module):
             self.length_head = LengthPredictionHead(
                 encoder_dim=self.bottleneck_dim,
                 condition_dim=time_emb_dim,
-                hidden_dim=time_emb_dim,
+                hidden_dim=256,
+                num_layers=5,
                 output_dim=1,
             )
         else:
@@ -402,7 +414,7 @@ class TrajectoryUNet(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,  # (batch, seq_len, 2)
+        x: torch.Tensor,  # (batch, seq_len, input_dim)
         time: torch.Tensor,  # (batch,)
         condition: torch.Tensor = None,  # (batch, 4) - 起点+终点
         alpha: torch.Tensor = None,  # (batch,) 或 (batch, 1) - 复杂度参数
@@ -415,7 +427,7 @@ class TrajectoryUNet(nn.Module):
         - Decoder: 由时间步 t 和复杂度系数 α 共同控制
 
         Args:
-            x: 噪声轨迹 (batch, seq_len, 2)
+            x: 噪声轨迹 (batch, seq_len, input_dim)
             time: 时间步 (batch,)
             condition: 起点+终点条件 (batch, 4)
             alpha: 复杂度/风格参数 (batch,) 或 (batch, 1)
@@ -463,19 +475,19 @@ class TrajectoryUNet(nn.Module):
         # 输出
         h = self.output_proj(h)
 
-        # 转换回 (batch, seq_len, 2)
+        # 转换回 (batch, seq_len, input_dim)
         return h.transpose(1, 2)
 
     def _encode(
         self,
-        x: torch.Tensor,          # (batch, seq_len, 2)
+        x: torch.Tensor,          # (batch, seq_len, input_dim)
         time_emb: torch.Tensor,   # (batch, time_emb_dim)
     ) -> torch.Tensor:
         """
         运行 encoder 部分，获取 bottleneck 特征
 
         Args:
-            x: 输入轨迹 (batch, seq_len, 2)
+            x: 输入轨迹 (batch, seq_len, input_dim)
             time_emb: 时间嵌入 (batch, time_emb_dim)
 
         Returns:
@@ -503,7 +515,7 @@ class TrajectoryUNet(nn.Module):
 
     def predict_length(
         self,
-        x: torch.Tensor,          # (batch, seq_len, 2) - 输入轨迹 (噪声或初始化)
+        x: torch.Tensor,          # (batch, seq_len, input_dim) - 输入轨迹 (噪声或初始化)
         condition: torch.Tensor,  # (batch, 4) - 起点+终点
         alpha: torch.Tensor,      # (batch,) 或 (batch, 1) - 复杂度参数
         time: torch.Tensor = None,  # (batch,) - 时间步 (默认 t=0)
@@ -515,7 +527,7 @@ class TrajectoryUNet(nn.Module):
         y = log(m + 1)
 
         Args:
-            x: 输入轨迹 (batch, seq_len, 2)
+            x: 输入轨迹 (batch, seq_len, input_dim)
             condition: 起点+终点条件 (batch, 4)
             alpha: 复杂度/风格参数 (batch,) 或 (batch, 1)
             time: 时间步 (batch,)，默认为 0
@@ -580,10 +592,10 @@ class TrajectoryUNet(nn.Module):
 if __name__ == "__main__":
     # 测试模型
     print("Testing TrajectoryUNet with Shared Encoder length prediction...")
-    model = TrajectoryUNet(seq_length=500, input_dim=2, enable_length_prediction=True)
+    model = TrajectoryUNet(seq_length=500, input_dim=3, enable_length_prediction=True)
 
     batch_size = 4
-    x = torch.randn(batch_size, 500, 2)
+    x = torch.randn(batch_size, 500, 3)  # [x, y, dt]
     t = torch.randint(0, 1000, (batch_size,))
     cond = torch.randn(batch_size, 4)
     # 复杂度参数 α = path_ratio ∈ [1, +∞)

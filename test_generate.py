@@ -21,8 +21,10 @@ from pathlib import Path
 from datetime import datetime
 import platform
 
+import apprise
+
 from src.models.alpha_ddim import create_alpha_ddim, EntropyController
-from src.utils.notify import send_image_result
+from src.data.dataset import denormalize_dt
 
 # 设置中文字体
 def setup_chinese_font():
@@ -125,7 +127,7 @@ def show_figure_with_scroll(fig, title="DMTG 轨迹生成结果"):
 
 def load_model(checkpoint_path: str, device: str = "cuda"):
     """加载训练好的模型"""
-    model = create_alpha_ddim(seq_length=500, device=device)
+    model = create_alpha_ddim(seq_length=500, input_dim=3, device=device)
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -138,14 +140,21 @@ def load_model(checkpoint_path: str, device: str = "cuda"):
 
 
 def compute_trajectory_metrics(trajectory: np.ndarray) -> dict:
-    """计算轨迹的各种指标"""
+    """计算轨迹的各种指标
+
+    Args:
+        trajectory: (N, 2) 或 (N, 3) 轨迹，支持 [x, y] 或 [x, y, dt]
+    """
+    # 只使用 x, y 计算几何指标
+    traj_xy = trajectory[:, :2]
+
     # 路径长度
-    segments = np.diff(trajectory, axis=0)
+    segments = np.diff(traj_xy, axis=0)
     segment_lengths = np.linalg.norm(segments, axis=1)
     path_length = np.sum(segment_lengths)
 
     # 直线距离
-    straight_dist = np.linalg.norm(trajectory[-1] - trajectory[0])
+    straight_dist = np.linalg.norm(traj_xy[-1] - traj_xy[0])
 
     # 路径比率 (复杂度)
     path_ratio = path_length / (straight_dist + 1e-8)
@@ -164,13 +173,28 @@ def compute_trajectory_metrics(trajectory: np.ndarray) -> dict:
     # 速度变化
     speed_std = np.std(segment_lengths)
 
-    return {
+    result = {
         'path_length': path_length,
         'straight_dist': straight_dist,
         'path_ratio': path_ratio,
         'curvature': curvature,
         'speed_std': speed_std,
     }
+
+    # 如果有 dt 列，计算时间相关指标
+    if trajectory.shape[1] >= 3:
+        dt_norm = trajectory[:, 2]  # 归一化后的时间差
+        dt_ms = denormalize_dt(dt_norm)  # 反归一化得到真实毫秒值
+
+        # 归一化值 (内部使用)
+        result['total_dt_norm'] = np.sum(dt_norm)
+        result['mean_dt_norm'] = np.mean(dt_norm[1:]) if len(dt_norm) > 1 else 0
+
+        # 真实毫秒值 (人类可读)
+        result['total_time_ms'] = np.sum(dt_ms)  # 总时间 (ms)
+        result['mean_dt_ms'] = np.mean(dt_ms[1:]) if len(dt_ms) > 1 else 0  # 平均帧间隔 (ms)
+
+    return result
 
 
 def compute_acceleration_directions(trajectory: np.ndarray) -> np.ndarray:
@@ -181,16 +205,19 @@ def compute_acceleration_directions(trajectory: np.ndarray) -> np.ndarray:
     返回加速度方向角度 (弧度，相对于 x 轴正方向)
 
     Args:
-        trajectory: 轨迹坐标 (N, 2)
+        trajectory: 轨迹坐标 (N, 2) 或 (N, 3)，只使用 x, y
 
     Returns:
         加速度方向角度数组 (N-2,)，范围 [-π, π]
     """
-    if len(trajectory) < 3:
+    # 只使用 x, y
+    traj_xy = trajectory[:, :2]
+
+    if len(traj_xy) < 3:
         return np.array([])
 
     # 速度 = 一阶差分
-    velocity = np.diff(trajectory, axis=0)  # (N-1, 2)
+    velocity = np.diff(traj_xy, axis=0)  # (N-1, 2)
 
     # 加速度 = 二阶差分 = 速度的一阶差分
     acceleration = np.diff(velocity, axis=0)  # (N-2, 2)
@@ -206,12 +233,12 @@ def classify_trajectory_direction(trajectory: np.ndarray) -> str:
     判断轨迹是上行还是下行
 
     Args:
-        trajectory: 轨迹坐标 (N, 2)
+        trajectory: 轨迹坐标 (N, 2) 或 (N, 3)
 
     Returns:
         "up" 或 "down"
     """
-    dy = trajectory[-1, 1] - trajectory[0, 1]
+    dy = trajectory[-1, 1] - trajectory[0, 1]  # y 坐标差
     return "up" if dy > 0 else "down"
 
 
@@ -643,11 +670,18 @@ def plot_combined_results_no_display(results: list, save_path: str = None, effec
 
 def print_metrics_table(results: list):
     """打印指标表格"""
-    print("\n" + "=" * 70)
+    # 检查是否有时间数据
+    has_time = any('total_time_ms' in r['metrics'] for r in results)
+
+    print("\n" + "=" * 90)
     print("轨迹指标统计")
-    print("=" * 70)
-    print(f"{'Alpha':<8} {'Path Ratio':<12} {'Curvature':<12} {'Speed Std':<12}")
-    print("-" * 70)
+    print("=" * 90)
+
+    if has_time:
+        print(f"{'Alpha':<8} {'Path Ratio':<12} {'Curvature':<12} {'Speed Std':<12} {'Total(ms)':<12} {'Mean dt(ms)':<12}")
+    else:
+        print(f"{'Alpha':<8} {'Path Ratio':<12} {'Curvature':<12} {'Speed Std':<12}")
+    print("-" * 90)
 
     alphas = sorted(set(r['alpha'] for r in results))
 
@@ -658,9 +692,14 @@ def print_metrics_table(results: list):
         curvs = [r['metrics']['curvature'] for r in alpha_results]
         speeds = [r['metrics']['speed_std'] for r in alpha_results]
 
-        print(f"{alpha:<8} {np.mean(ratios):<12.3f} {np.mean(curvs):<12.3f} {np.mean(speeds):<12.4f}")
+        if has_time:
+            total_times = [r['metrics'].get('total_time_ms', 0) for r in alpha_results]
+            mean_dts = [r['metrics'].get('mean_dt_ms', 0) for r in alpha_results]
+            print(f"{alpha:<8} {np.mean(ratios):<12.3f} {np.mean(curvs):<12.3f} {np.mean(speeds):<12.4f} {np.mean(total_times):<12.1f} {np.mean(mean_dts):<12.2f}")
+        else:
+            print(f"{alpha:<8} {np.mean(ratios):<12.3f} {np.mean(curvs):<12.3f} {np.mean(speeds):<12.4f}")
 
-    print("=" * 70)
+    print("=" * 90)
 
 
 def main():
@@ -813,16 +852,14 @@ def main():
     # 发送 webhook 通知
     if args.webhook:
         print(f"\n正在发送通知到 webhook...")
-        success = send_image_result(
+        apobj = apprise.Apprise()
+        apobj.add(args.webhook)
+        success = apobj.notify(
             title=f"DMTG Generate - {args.label or 'test'}",
-            image_path=str(save_path),
-            description=f"Alphas: {alphas}\nSamples: {len(all_results)}",
-            webhook_url=args.webhook,
+            body=f"Alphas: {alphas}\nSamples: {len(all_results)}",
+            attach=str(save_path),
         )
-        if success:
-            print("通知发送成功!")
-        else:
-            print("通知发送失败")
+        print("通知发送成功!" if success else "通知发送失败")
 
     # 加速度方向分布图 (论文 Fig.6)
     if args.acceleration_dist:
@@ -839,11 +876,12 @@ def main():
         )
         # 发送加速度分布图到 webhook
         if args.webhook:
-            send_image_result(
+            apobj = apprise.Apprise()
+            apobj.add(args.webhook)
+            apobj.notify(
                 title=f"DMTG Acceleration - {args.label or 'test'}",
-                image_path=str(accel_save_path),
-                description="Acceleration direction distribution (Fig.6)",
-                webhook_url=args.webhook,
+                body="Acceleration direction distribution (Fig.6)",
+                attach=str(accel_save_path),
             )
 
     print("完成!")

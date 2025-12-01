@@ -5,6 +5,9 @@ Webhook 通知工具
 安装: pip install apprise
 """
 import os
+import sys
+import subprocess
+import threading
 from pathlib import Path
 
 import apprise
@@ -96,6 +99,113 @@ def send_image_result(
     """
     body = description or f"Image: {Path(image_path).name}"
     return send_notification(title, body, webhook_url, image_path)
+
+
+def run_script_async(
+    name: str,
+    cmd: list,
+    cwd: str = None,
+    webhook_url: str = None,
+    label: str = None,
+) -> threading.Thread:
+    """
+    在后台线程运行脚本
+
+    Args:
+        name: 脚本名称（用于日志）
+        cmd: 命令列表
+        cwd: 工作目录
+        webhook_url: Webhook URL（会自动添加 --webhook 参数）
+        label: 标签（用于日志）
+
+    Returns:
+        启动的线程对象
+    """
+    def _run():
+        try:
+            # 添加 webhook 参数
+            run_cmd = cmd.copy()
+            if webhook_url:
+                run_cmd.extend(["--webhook", webhook_url])
+
+            label_str = f": {label}" if label else ""
+            print(f"[{name}] Starting{label_str}")
+            result = subprocess.run(run_cmd, cwd=cwd, capture_output=True, text=True)
+
+            if result.returncode == 0:
+                print(f"[{name}] Completed{label_str}")
+            else:
+                print(f"[{name}] Failed: {result.stderr[:200]}")
+        except Exception as e:
+            print(f"[{name}] Error: {e}")
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    return thread
+
+
+def run_visualization_scripts(
+    checkpoint_path: str,
+    label: str,
+    webhook_url: str = None,
+    human_data_dir: str = None,
+    cwd: str = None,
+) -> list:
+    """
+    运行所有可视化脚本（t-SNE、轨迹生成等）
+
+    Args:
+        checkpoint_path: 模型检查点路径
+        label: 输出文件标签
+        webhook_url: Webhook URL
+        human_data_dir: 人类数据目录
+        cwd: 工作目录（脚本所在目录）
+
+    Returns:
+        启动的线程列表
+    """
+    if cwd is None:
+        cwd = str(Path(__file__).parent.parent.parent)  # 项目根目录
+
+    threads = []
+
+    # 1. 空间特征 t-SNE (plot_tsne_distribution.py)
+    cmd_tsne_spatial = [
+        sys.executable, "plot_tsne_distribution.py",
+        "-c", checkpoint_path,
+        "-l", label,
+        "--num_human", "300",
+        "--num_model", "300",
+        "--device", "cpu",
+        "--no_display",
+    ]
+    if human_data_dir:
+        cmd_tsne_spatial.extend(["--human_data", human_data_dir])
+    threads.append(run_script_async("t-SNE-Spatial", cmd_tsne_spatial, cwd, webhook_url, label))
+
+    # 2. 时间特征 t-SNE (plot_tsne_temporal.py)
+    cmd_tsne_temporal = [
+        sys.executable, "plot_tsne_temporal.py",
+        "--checkpoint", checkpoint_path,
+        "--label", label,
+        "--num_samples", "300",
+        "--device", "cpu",
+        "--no_display",
+    ]
+    threads.append(run_script_async("t-SNE-Temporal", cmd_tsne_temporal, cwd, webhook_url, label))
+
+    # 3. 轨迹生成测试 (test_generate.py)
+    cmd_generate = [
+        sys.executable, "test_generate.py",
+        "--checkpoint", checkpoint_path,
+        "-l", label,
+        "--num_samples", "3",
+        "--device", "cpu",
+        "--no_display",
+    ]
+    threads.append(run_script_async("Generate", cmd_generate, cwd, webhook_url, label))
+
+    return threads
 
 
 if __name__ == "__main__":

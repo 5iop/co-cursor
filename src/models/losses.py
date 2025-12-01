@@ -58,10 +58,10 @@ class DMTGLoss(nn.Module):
         L = w1·LDDIM + w2·Lsim + w3·Lstyle + w4·Llength
 
         Args:
-            predicted_noise: 预测的噪声 (batch, seq_len, 2)
-            target_noise: 目标噪声 (batch, seq_len, 2)
-            predicted_x0: 预测的轨迹 p_a (batch, seq_len, 2)
-            target_x0: 人类模板轨迹 X̂ (batch, seq_len, 2)
+            predicted_noise: 预测的噪声 (batch, seq_len, input_dim)
+            target_noise: 目标噪声 (batch, seq_len, input_dim)
+            predicted_x0: 预测的轨迹 p_a (batch, seq_len, input_dim)
+            target_x0: 人类模板轨迹 X̂ (batch, seq_len, input_dim)
             alpha: 目标复杂度参数 (batch,) - 用于Lstyle
             t: 时间步
             timesteps: 总时间步数
@@ -145,39 +145,43 @@ class DMTGLoss(nn.Module):
         - α 是 path_ratio = path_length / straight_distance
         - α ∈ [1, +∞)，α=1 表示直线
         - 直接比较目标 α 和生成轨迹的 ratio
+        - 注意: 只使用 x, y 维度计算路径长度，忽略 dt
 
         Args:
-            predicted: 生成轨迹 (batch, seq_len, 2)
+            predicted: 生成轨迹 (batch, seq_len, input_dim)
             alpha: 目标 path_ratio (batch,) ∈ [1, +∞)
             mask: 有效位置掩码 (batch, seq_len)
         """
         batch_size = predicted.shape[0]
+
+        # 只使用 x, y 维度计算路径长度
+        predicted_xy = predicted[:, :, :2]  # (batch, seq_len, 2)
 
         if mask is not None:
             # 对于每个样本，找到最后一个有效位置的索引
             # mask: (batch, seq_len)
             lengths = mask.sum(dim=1).long()  # (batch,)
 
-            # 计算路径长度（只计算有效段）
-            segments = predicted[:, 1:, :] - predicted[:, :-1, :]  # (batch, seq-1, 2)
+            # 计算路径长度（只计算有效段，仅 x, y）
+            segments = predicted_xy[:, 1:, :] - predicted_xy[:, :-1, :]  # (batch, seq-1, 2)
             segment_norms = torch.norm(segments, dim=-1)  # (batch, seq-1)
             # 只计算mask有效范围内的段
             segment_mask = mask[:, 1:] * mask[:, :-1]  # (batch, seq-1)
             path_length = (segment_norms * segment_mask).sum(dim=-1)  # (batch,)
 
-            # 获取每个样本的真实终点
+            # 获取每个样本的真实终点 (仅 x, y)
             # 使用 lengths-1 作为索引获取最后一个有效点
             end_indices = (lengths - 1).clamp(min=0)  # (batch,)
-            end_points = predicted[torch.arange(batch_size, device=predicted.device), end_indices]  # (batch, 2)
-            start_points = predicted[:, 0, :]  # (batch, 2)
+            end_points = predicted_xy[torch.arange(batch_size, device=predicted.device), end_indices]  # (batch, 2)
+            start_points = predicted_xy[:, 0, :]  # (batch, 2)
         else:
-            # 无mask时使用全部数据
-            segments = predicted[:, 1:, :] - predicted[:, :-1, :]
+            # 无mask时使用全部数据 (仅 x, y)
+            segments = predicted_xy[:, 1:, :] - predicted_xy[:, :-1, :]
             path_length = torch.norm(segments, dim=-1).sum(dim=-1)
-            end_points = predicted[:, -1, :]
-            start_points = predicted[:, 0, :]
+            end_points = predicted_xy[:, -1, :]
+            start_points = predicted_xy[:, 0, :]
 
-        # 直线距离
+        # 直线距离 (仅 x, y)
         straight_dist = torch.norm(end_points - start_points, dim=-1) + 1e-8  # (batch,)
 
         # 计算生成轨迹的 path_ratio (与 compute_trajectory_alpha 一致)
@@ -203,8 +207,8 @@ class DMTGLoss(nn.Module):
         只对 aux_mask=1 的样本计算损失，用于 t < 0.5T 约束
 
         Args:
-            predicted: 预测轨迹 (batch, seq_len, 2)
-            template: 人类模板轨迹 (batch, seq_len, 2)
+            predicted: 预测轨迹 (batch, seq_len, input_dim)
+            template: 人类模板轨迹 (batch, seq_len, input_dim)
             mask: 有效位置掩码 (batch, seq_len)
             aux_mask: 辅助损失掩码 (batch,), 1 表示计算损失
         """
@@ -235,7 +239,7 @@ class DMTGLoss(nn.Module):
         只对 aux_mask=1 的样本计算损失，用于 t < 0.5T 约束
 
         Args:
-            predicted: 生成轨迹 (batch, seq_len, 2)
+            predicted: 生成轨迹 (batch, seq_len, input_dim)
             alpha: 目标 path_ratio (batch,)
             mask: 有效位置掩码 (batch, seq_len)
             aux_mask: 辅助损失掩码 (batch,), 1 表示计算损失
@@ -295,10 +299,10 @@ if __name__ == "__main__":
     batch_size = 4
     seq_len = 50
 
-    predicted_noise = torch.randn(batch_size, seq_len, 2)
-    target_noise = torch.randn(batch_size, seq_len, 2)
-    predicted_x0 = torch.randn(batch_size, seq_len, 2)
-    target_x0 = torch.randn(batch_size, seq_len, 2)  # human template
+    predicted_noise = torch.randn(batch_size, seq_len, 3)  # input_dim=3 (x, y, dt)
+    target_noise = torch.randn(batch_size, seq_len, 3)
+    predicted_x0 = torch.randn(batch_size, seq_len, 3)
+    target_x0 = torch.randn(batch_size, seq_len, 3)  # human template
     alpha = 1.0 + torch.rand(batch_size) * 4.0  # target complexity α ∈ [1, 5]
 
     # 长度预测测试数据
@@ -329,9 +333,11 @@ if __name__ == "__main__":
     print(f"\nAlpha values (target complexity): {[f'{a:.3f}' for a in alpha.tolist()]}")
 
     # Verify Lstyle: ||target_ratio - ratio(p_a)||^2
-    segments = predicted_x0[:, 1:, :] - predicted_x0[:, :-1, :]
+    # 只使用 x, y 维度计算路径长度
+    predicted_xy = predicted_x0[:, :, :2]
+    segments = predicted_xy[:, 1:, :] - predicted_xy[:, :-1, :]
     path_length = torch.norm(segments, dim=-1).sum(dim=-1)
-    straight_dist = torch.norm(predicted_x0[:, -1, :] - predicted_x0[:, 0, :], dim=-1) + 1e-8
+    straight_dist = torch.norm(predicted_xy[:, -1, :] - predicted_xy[:, 0, :], dim=-1) + 1e-8
     pred_ratio = path_length / straight_dist
     target_ratio = 1.0 + alpha * 2.0
 
