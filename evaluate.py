@@ -23,23 +23,35 @@ from src.evaluation.visualize import TrajectoryVisualizer, create_comparison_rep
 
 def load_model(checkpoint_path: str, device: str = "cuda"):
     """加载训练好的模型"""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # 从检查点读取模型配置（如果有），否则使用默认值
-    model_config = checkpoint.get('model_config', {})
-    seq_length = model_config.get('seq_length', 500)
-    timesteps = model_config.get('timesteps', 1000)
-    base_channels = model_config.get('base_channels', 64)
+    config = checkpoint.get('model_config', {})
+    seq_length = config.get('seq_length', 500)
+    timesteps = config.get('timesteps', 1000)
+    input_dim = config.get('input_dim', 3)
+    base_channels = config.get('base_channels', 96)
+    enable_length_prediction = config.get('enable_length_prediction', False)
 
-    model = create_alpha_ddim(
+    # 创建与训练时相同配置的模型
+    from src.models.unet import TrajectoryUNet
+    unet = TrajectoryUNet(
         seq_length=seq_length,
-        timesteps=timesteps,
+        input_dim=input_dim,
         base_channels=base_channels,
-        device=device
+        enable_length_prediction=enable_length_prediction,
     )
+    model = AlphaDDIM(
+        model=unet,
+        timesteps=timesteps,
+        seq_length=seq_length,
+        input_dim=input_dim,
+    ).to(device)
+
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
+    print(f"Loaded model: base_channels={base_channels}, length_pred={enable_length_prediction}")
     return model
 
 

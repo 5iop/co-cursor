@@ -141,9 +141,9 @@ class Trainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
-        # 优化器
+        # 优化器 - 在 DDP 包装之后创建，确保使用正确的参数
         self.optimizer = optim.AdamW(
-            model.parameters(),
+            self.model.parameters(),  # 使用 DDP 包装后的模型参数
             lr=lr,
             weight_decay=0.01,
         )
@@ -226,6 +226,8 @@ class Trainer:
             predicted_x0 = self.model_raw.predict_x0_from_noise(x_t, t, predicted_noise)
 
             # 长度预测 (如果模型支持)
+            # 注意: DDP 只同步 forward() 的梯度，predict_length 不经过 forward
+            # 但由于 predict_length 内部使用的参数都属于 DDP 包装的模块，梯度会正确同步
             predicted_log_length = None
             unet = self.model_raw.model.module if self.distributed else self.model_raw.model
             if hasattr(unet, 'length_head') and unet.length_head is not None:
@@ -292,6 +294,10 @@ class Trainer:
         total_loss = 0
         num_batches = 0
 
+        # DDP: 设置 sampler 的 epoch 以确保验证数据一致性
+        if self.distributed and hasattr(self.val_loader.sampler, 'set_epoch'):
+            self.val_loader.sampler.set_epoch(self.epoch)
+
         for batch in tqdm(self.val_loader, desc="Validation", disable=not is_main_process()):
             trajectory = batch['trajectory'].to(self.device)
             mask = batch['mask'].to(self.device)  # 有效位置掩码
@@ -316,6 +322,8 @@ class Trainer:
             predicted_x0 = self.model_raw.predict_x0_from_noise(x_t, t, predicted_noise)
 
             # 长度预测 (如果模型支持)
+            # 注意: DDP 只同步 forward() 的梯度，predict_length 不经过 forward
+            # 但由于 predict_length 内部使用的参数都属于 DDP 包装的模块，梯度会正确同步
             predicted_log_length = None
             unet = self.model_raw.model.module if self.distributed else self.model_raw.model
             if hasattr(unet, 'length_head') and unet.length_head is not None:
@@ -373,6 +381,7 @@ class Trainer:
             'timesteps': self.model_raw.timesteps,
             'input_dim': self.model_raw.input_dim,
             'base_channels': unet.base_channels if hasattr(unet, 'base_channels') else 64,
+            'enable_length_prediction': unet.length_head is not None if hasattr(unet, 'length_head') else False,
         }
 
         checkpoint = {
@@ -499,8 +508,8 @@ class Trainer:
                     self.best_loss = val_loss
                     self.save_checkpoint("best_model.pt")
                     self.run_tsne_plot_async()  # 后台运行 t-SNE 绘图
-                    # 发送 best model 通知
-                    if self.webhook_url:
+                    # 发送 best model 通知 (只在主进程发送)
+                    if self.webhook_url and is_main_process():
                         send_training_update(
                             epoch=self.epoch,
                             loss=val_loss,
@@ -514,8 +523,8 @@ class Trainer:
                     self.best_loss = train_loss
                     self.save_checkpoint("best_model.pt")
                     self.run_tsne_plot_async()  # 后台运行 t-SNE 绘图
-                    # 发送 best model 通知
-                    if self.webhook_url:
+                    # 发送 best model 通知 (只在主进程发送)
+                    if self.webhook_url and is_main_process():
                         send_training_update(
                             epoch=self.epoch,
                             loss=train_loss,
@@ -528,10 +537,10 @@ class Trainer:
             # 更新学习率
             self.scheduler.step()
 
-            # 周期性训练进度通知（best model 已发送时跳过）
+            # 周期性训练进度通知（best model 已发送时跳过，只在主进程发送）
             is_best_this_epoch = (self.val_loader and val_loss == self.best_loss) or \
                                  (not self.val_loader and train_loss == self.best_loss)
-            if self.webhook_url and self.epoch % self.notify_every == 0 and not is_best_this_epoch:
+            if self.webhook_url and is_main_process() and self.epoch % self.notify_every == 0 and not is_best_this_epoch:
                 current_loss = val_loss if self.val_loader else train_loss
                 send_training_update(
                     epoch=self.epoch,
@@ -557,6 +566,13 @@ class Trainer:
         self.save_checkpoint("final_model.pt")
         if is_main_process():
             print("Training completed!")
+            # 发送训练完成通知
+            if self.webhook_url:
+                send_notification(
+                    title="DMTG Training Completed",
+                    body=f"Epochs: {self.epoch}\nBest Loss: {self.best_loss:.4f}",
+                    webhook_url=self.webhook_url,
+                )
 
     def save_training_log(self):
         """保存训练日志 (只在主进程保存)"""

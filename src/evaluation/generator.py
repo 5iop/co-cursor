@@ -11,6 +11,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.models.alpha_ddim import AlphaDDIM, create_alpha_ddim
+from src.models.unet import TrajectoryUNet
 
 
 class TrajectoryGenerator:
@@ -59,25 +60,35 @@ class TrajectoryGenerator:
 
     def _load_model(self, checkpoint_path: str) -> AlphaDDIM:
         """加载模型检查点"""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
         # 从检查点读取模型配置（如果有），否则使用默认值
-        model_config = checkpoint.get('model_config', {})
-        seq_length = model_config.get('seq_length', self.seq_length)
-        timesteps = model_config.get('timesteps', 1000)
-        base_channels = model_config.get('base_channels', 64)
+        config = checkpoint.get('model_config', {})
+        seq_length = config.get('seq_length', self.seq_length)
+        timesteps = config.get('timesteps', 1000)
+        input_dim = config.get('input_dim', 3)
+        base_channels = config.get('base_channels', 96)
+        enable_length_prediction = config.get('enable_length_prediction', False)
 
         # 更新实例的seq_length以匹配加载的模型
         self.seq_length = seq_length
 
-        model = create_alpha_ddim(
+        # 创建与训练时相同配置的模型
+        unet = TrajectoryUNet(
             seq_length=seq_length,
-            timesteps=timesteps,
+            input_dim=input_dim,
             base_channels=base_channels,
-            device=self.device
+            enable_length_prediction=enable_length_prediction,
         )
+        model = AlphaDDIM(
+            model=unet,
+            timesteps=timesteps,
+            seq_length=seq_length,
+            input_dim=input_dim,
+        ).to(self.device)
 
         model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded model: base_channels={base_channels}, length_pred={enable_length_prediction}")
         return model
 
     @torch.no_grad()

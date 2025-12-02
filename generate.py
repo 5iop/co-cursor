@@ -12,7 +12,8 @@ import orjson
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.models.alpha_ddim import create_alpha_ddim
+from src.models.alpha_ddim import AlphaDDIM, create_alpha_ddim
+from src.models.unet import TrajectoryUNet
 from src.evaluation.generator import TrajectoryGenerator
 from src.evaluation.visualize import TrajectoryVisualizer
 
@@ -102,24 +103,34 @@ def main():
     checkpoint_path = Path(args.checkpoint)
     if checkpoint_path.exists():
         print(f"\nLoading model from {checkpoint_path}...")
-        checkpoint = torch.load(str(checkpoint_path), map_location=args.device)
+        checkpoint = torch.load(str(checkpoint_path), map_location=args.device, weights_only=False)
 
         # 从检查点读取模型配置（如果有），否则使用默认值
-        model_config = checkpoint.get('model_config', {})
-        seq_length = model_config.get('seq_length', 500)
-        timesteps = model_config.get('timesteps', 1000)
-        base_channels = model_config.get('base_channels', 64)
+        config = checkpoint.get('model_config', {})
+        seq_length = config.get('seq_length', 500)
+        timesteps = config.get('timesteps', 1000)
+        input_dim = config.get('input_dim', 3)
+        base_channels = config.get('base_channels', 96)
+        enable_length_prediction = config.get('enable_length_prediction', False)
 
-        model = create_alpha_ddim(
+        # 创建与训练时相同配置的模型
+        unet = TrajectoryUNet(
             seq_length=seq_length,
-            timesteps=timesteps,
+            input_dim=input_dim,
             base_channels=base_channels,
-            device=args.device
+            enable_length_prediction=enable_length_prediction,
         )
+        model = AlphaDDIM(
+            model=unet,
+            timesteps=timesteps,
+            seq_length=seq_length,
+            input_dim=input_dim,
+        ).to(args.device)
+
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
         generator = TrajectoryGenerator(model=model, device=args.device)
-        print(f"  Model config: seq_length={seq_length}, timesteps={timesteps}, base_channels={base_channels}")
+        print(f"  Model config: base_channels={base_channels}, length_pred={enable_length_prediction}")
     else:
         print("\nNo checkpoint found, using untrained model...")
         generator = TrajectoryGenerator(device=args.device)

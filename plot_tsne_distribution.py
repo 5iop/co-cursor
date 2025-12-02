@@ -571,16 +571,40 @@ def main():
 
     # 加载模型
     print("\nLoading model...")
-    model = create_alpha_ddim(seq_length=500, timesteps=1000, input_dim=3, device=args.device)
-
     checkpoint_path = Path(args.checkpoint)
     if checkpoint_path.exists():
         checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
+
+        # 从 checkpoint 获取模型配置
+        config = checkpoint.get('model_config', {})
+        seq_length = config.get('seq_length', 500)
+        timesteps = config.get('timesteps', 1000)
+        input_dim = config.get('input_dim', 3)
+        base_channels = config.get('base_channels', 96)
+        enable_length_prediction = config.get('enable_length_prediction', False)
+
+        # 创建与训练时相同配置的模型
+        from src.models.unet import TrajectoryUNet
+        unet = TrajectoryUNet(
+            seq_length=seq_length,
+            input_dim=input_dim,
+            base_channels=base_channels,
+            enable_length_prediction=enable_length_prediction,
+        )
+        model = AlphaDDIM(
+            model=unet,
+            timesteps=timesteps,
+            seq_length=seq_length,
+            input_dim=input_dim,
+        ).to(args.device)
+
         model.load_state_dict(checkpoint['model_state_dict'])
         print(f"Loaded checkpoint: {args.checkpoint}")
+        print(f"  Config: base_channels={base_channels}, length_pred={enable_length_prediction}")
     else:
         print(f"Warning: Checkpoint not found at {args.checkpoint}")
         print("Using untrained model (random weights)")
+        model = create_alpha_ddim(seq_length=500, timesteps=1000, input_dim=3, device=args.device)
         if not args.use_fixed_length:
             print("Hint: Consider using --use_fixed_length for untrained models")
 

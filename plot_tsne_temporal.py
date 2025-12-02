@@ -34,7 +34,8 @@ import platform
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.models.alpha_ddim import create_alpha_ddim
+from src.models.alpha_ddim import AlphaDDIM, create_alpha_ddim
+from src.models.unet import TrajectoryUNet
 from src.data.dataset import CombinedMouseDataset, denormalize_dt
 from src.utils.notify import send_image_result
 
@@ -462,19 +463,32 @@ def main():
         print(f"Error: Checkpoint not found at {args.checkpoint}")
         return
 
-    # 创建模型
-    model = create_alpha_ddim(seq_length=500, timesteps=1000, input_dim=3, device=args.device)
-
+    # 加载 checkpoint 并读取模型配置
     checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.to(args.device)  # 确保模型在正确设备上
-    model.model.eval()
+    config = checkpoint.get('model_config', {})
+    seq_length = config.get('seq_length', 500)
+    timesteps = config.get('timesteps', 1000)
+    input_dim = config.get('input_dim', 3)
+    base_channels = config.get('base_channels', 96)
+    enable_length_prediction = config.get('enable_length_prediction', False)
 
-    # 从 checkpoint 读取配置 (用于显示)
-    model_config = checkpoint.get('model_config', {})
-    seq_length = model_config.get('seq_length', 500)
-    input_dim = model_config.get('input_dim', 3)
-    print(f"Model loaded: seq_length={seq_length}, input_dim={input_dim}")
+    # 创建与训练时相同配置的模型
+    unet = TrajectoryUNet(
+        seq_length=seq_length,
+        input_dim=input_dim,
+        base_channels=base_channels,
+        enable_length_prediction=enable_length_prediction,
+    )
+    model = AlphaDDIM(
+        model=unet,
+        timesteps=timesteps,
+        seq_length=seq_length,
+        input_dim=input_dim,
+    ).to(args.device)
+
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.model.eval()
+    print(f"Model loaded: base_channels={base_channels}, length_pred={enable_length_prediction}")
 
     # 加载人类轨迹
     human_features, human_sources = load_human_trajectories(

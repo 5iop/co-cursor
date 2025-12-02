@@ -126,14 +126,37 @@ def show_figure_with_scroll(fig, title="DMTG 轨迹生成结果"):
 
 def load_model(checkpoint_path: str, device: str = "cuda"):
     """加载训练好的模型"""
-    model = create_alpha_ddim(seq_length=500, input_dim=3, device=device)
-
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # 从 checkpoint 获取模型配置
+    config = checkpoint.get('model_config', {})
+    seq_length = config.get('seq_length', 500)
+    timesteps = config.get('timesteps', 1000)
+    input_dim = config.get('input_dim', 3)
+    base_channels = config.get('base_channels', 96)
+    enable_length_prediction = config.get('enable_length_prediction', False)
+
+    # 创建与训练时相同配置的模型
+    from src.models.unet import TrajectoryUNet
+    unet = TrajectoryUNet(
+        seq_length=seq_length,
+        input_dim=input_dim,
+        base_channels=base_channels,
+        enable_length_prediction=enable_length_prediction,
+    )
+    model = AlphaDDIM(
+        model=unet,
+        timesteps=timesteps,
+        seq_length=seq_length,
+        input_dim=input_dim,
+    ).to(device)
+
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
     epoch = checkpoint.get('epoch', 'unknown')
     print(f"Loaded model from epoch {epoch}")
+    print(f"  Config: base_channels={base_channels}, length_pred={enable_length_prediction}")
 
     return model
 
