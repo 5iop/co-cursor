@@ -285,9 +285,8 @@ class AlphaDDIM(nn.Module):
                 alpha_tensor = torch.full((batch_size,), alpha_clamped, device=device, dtype=torch.float32)
                 # 创建初始输入 (纯高斯噪声，对应 t=T) 用于 Shared Encoder 长度预测
                 x_init = torch.randn(batch_size, self.seq_length, self.input_dim, device=device)
-                # 预测长度 - 传入 t=T-1 (最大时间步索引)，让 Encoder 知道这是纯噪声
-                t_max = torch.full((batch_size,), self.timesteps - 1, device=device, dtype=torch.long)
-                log_length = self.model.predict_length(x_init, condition, alpha_tensor, time=t_max)
+                # 预测长度
+                log_length = self.model.predict_length(x_init, condition, alpha_tensor)
                 predicted_lengths = self.model.decode_length(log_length, max_length=self.seq_length)
                 # 使用 per-sample 长度
                 effective_length = predicted_lengths
@@ -539,7 +538,7 @@ class AlphaDDIM(nn.Module):
             mask[:, 0, 2:] = 1.0  # 起点 (dt[0] = 0)
 
         # 创建条件值 X_c
-        x_c = x.clone()  # 复制原始轨迹
+        x_c = torch.zeros_like(x)  # 从零开始构建条件值
         x_c[:, 0, :2] = start_point  # 起点 (x, y)
         if self.input_dim > 2:
             x_c[:, 0, 2:] = 0.0  # dt[0] = 0
@@ -1157,7 +1156,7 @@ class EntropyController:
 def create_alpha_ddim(
     seq_length: int = 500,
     timesteps: int = 1000,
-    base_channels: int = 128,  # 方案B: 64→128
+    base_channels: int = 96,  # 与 unet.py 保持一致
     input_dim: int = 3,  # x, y, dt
     device: str = "cuda",
 ) -> AlphaDDIM:

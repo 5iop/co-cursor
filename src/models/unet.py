@@ -313,7 +313,7 @@ class TrajectoryUNet(nn.Module):
         self,
         seq_length: int = 500,
         input_dim: int = 3,  # x, y, dt
-        base_channels: int = 64,
+        base_channels: int = 96,
         channel_mults: tuple = (1, 2, 4),
         time_emb_dim: int = 128,
         condition_dim: int = 4,  # 起点(2) + 终点(2)
@@ -360,7 +360,7 @@ class TrajectoryUNet(nn.Module):
             self.length_head = LengthPredictionHead(
                 encoder_dim=self.bottleneck_dim,
                 condition_dim=time_emb_dim,
-                hidden_dim=512,
+                hidden_dim=256,
                 num_layers=3,
                 output_dim=1,
             )
