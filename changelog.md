@@ -1,14 +1,37 @@
 # Changelog
 
-## [Unreleased] - 2025-12-01
+## [Unreleased] - 2025-12-02
 
-### Webhook 通知修复
+### dt 维度噪声修复
+
+修复生成轨迹中 dt (时间差) 预测混乱的问题。
+
+#### src/models/alpha_ddim.py
+- **噪声尺度统一**: dt 采样噪声从 σ=1 改为与 x,y 相同的 `σ = k_c * distance`
+  - 修复初始化和采样之间的尺度不匹配
+  - 避免 dt 噪声是 x,y 的 ~20 倍导致的不稳定
+- **dt[0]=0 边界约束**:
+  - `_initialize_with_condition()`: 分离 `mask_xy` 和 `mask_dt`，确保起点 dt=0
+  - `_enforce_boundary_inpainting()`: 每步采样强制 dt[0]=0
+- **问题根因**:
+  1. Noise Scale Mismatch: dt 初始化用小噪声，采样用大噪声
+  2. Missing Boundary: dt[0] 未约束，允许漂移
+  3. Scale Imbalance: dt 噪声远大于 x,y 噪声
+
+---
+
+### Webhook 通知系统
 
 - **notify.py**: 从 apprise URL schema 改为直接 HTTP 请求
   - URL 格式: `https://host/notify/key` (Apprise API 服务器)
   - 使用 `requests.post()` 发送 form data 和文件附件
   - 支持图片附件发送
 - **可视化脚本**: 统一使用 `send_image_result()` 发送通知
+- **训练失败通知**: 添加信号处理和异常捕获
+  - 捕获 SIGTERM、SIGINT 信号发送通知
+  - 捕获 Python 异常发送错误信息
+  - 注意: SIGKILL (OOM) 无法被捕获
+- **修复重复通知**: 同一 epoch 保存最佳模型时不再重复发送周期性通知
 
 ---
 
@@ -78,6 +101,11 @@
 
 - **Parquet 列变更**: `t` (时间戳) → `dt` (时间差)
 
+- **数据加载优化**:
+  - 移除运行时 `straight_dist` 过滤，加速数据加载
+  - `min_straight_dist` 默认值改为 0.0
+  - Eager 模式使用 `to_pandas()` 批量转换替代逐行 `as_py()`
+
 #### CombinedMouseDataset
 - 移除 `sapimouse_dir` 参数
 - 移除 `normalize` 参数
@@ -119,6 +147,8 @@
 - **`--base_channels`**: 默认值 64 → 128
 - **`input_dim`**: 硬编码为 3
 - 移除 SapiMouse 路径检查逻辑
+- **新增 `--no_persistent_workers`**: 禁用 DataLoader 的 persistent_workers 以减少内存占用
+- **`--num_workers`**: 默认值 16 → 4
 
 ---
 
@@ -138,6 +168,28 @@
 - **`extract_trajectory_features()`**: 支持 `(N, 3)` 输入，仅使用 x, y 提取特征
 - **`load_human_trajectories()`**: 移除 `sapimouse_dir` 参数
 - **`create_alpha_ddim()`**: 添加 `input_dim=3`
+
+#### plot_tsne_temporal.py (新增)
+- 时序 t-SNE 可视化工具
+- 分析轨迹特征随时间的分布变化
+- 支持 webhook 通知发送结果图片
+
+---
+
+### 新增工具
+
+#### tools/analyze_datasets.py (新增)
+- 数据集分析工具
+- 统计轨迹长度、点数、时间分布等指标
+- 生成数据集质量报告
+
+---
+
+### 部署脚本
+
+#### download_dataset.sh
+- 新增安装 `btop` 和 `nvtop` 系统监控工具
+- 命令: `sudo apt-get -y install aria2 vim btop nvtop`
 
 ---
 

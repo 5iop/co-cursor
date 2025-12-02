@@ -199,9 +199,9 @@ class AlphaDDIM(nn.Module):
         sigma_epsilon = (kc * direction_norm).unsqueeze(1)  # (batch, 1, 1)
         z_n_xy = sigma_epsilon * torch.randn(batch_size, self.seq_length, 2, device=x_t.device)
 
-        # 各向同性噪声 (dt 维度): 使用标准高斯 σ=1，因为 dt 已归一化到 [0,1]
-        # 注意: dt 与空间距离无关，不应使用距离缩放
-        z_n_dt = torch.randn(batch_size, self.seq_length, self.input_dim - 2, device=x_t.device) if self.input_dim > 2 else None
+        # 各向同性噪声 (dt 维度): 使用与 x,y 相同的缩放因子，保持尺度一致
+        # dt 已归一化到 [0,1]，使用相同的 σ_epsilon 避免尺度不匹配
+        z_n_dt = sigma_epsilon * torch.randn(batch_size, self.seq_length, self.input_dim - 2, device=x_t.device) if self.input_dim > 2 else None
 
         # 论文 Eq.6: 混合协方差采样
         # 将 α ∈ [1, +∞) 转换为混合系数 a ∈ [0, 1)
@@ -430,31 +430,37 @@ class AlphaDDIM(nn.Module):
         sigma_epsilon = k_c * distance  # (batch, 1)
         sigma_epsilon = sigma_epsilon.unsqueeze(2)  # (batch, 1, 1) for broadcasting
 
-        # 创建掩码 M (论文 Eq.2) - 仅对 x, y 维度有效
-        mask = torch.zeros(batch_size, self.seq_length, 1, device=device)
-        mask[:, 0, :] = 1.0   # 起点掩码
+        # 创建掩码 M (论文 Eq.2)
+        # x, y 维度: 起点和终点
+        # dt 维度: 仅起点 (dt[0] = 0)
+        mask_xy = torch.zeros(batch_size, self.seq_length, 2, device=device)
+        mask_xy[:, 0, :] = 1.0   # 起点掩码 (x, y)
 
-        # 创建条件值 X_c (仅设置 x, y 维度，dt 维度为 0)
+        mask_dt = torch.zeros(batch_size, self.seq_length, self.input_dim - 2, device=device) if self.input_dim > 2 else None
+        if mask_dt is not None:
+            mask_dt[:, 0, :] = 1.0  # 起点掩码 (dt[0] = 0)
+
+        # 创建条件值 X_c
         x_c = torch.zeros(batch_size, self.seq_length, self.input_dim, device=device)
-        x_c[:, 0, :2] = start_point   # 起点 (仅 x, y)
+        x_c[:, 0, :2] = start_point   # 起点 (x, y)
+        # dt[0] = 0 已经是默认值，无需显式设置
 
         if is_per_sample:
             # Per-sample: 使用 scatter_ 设置每个样本的终点位置
             end_indices = (lengths - 1).clamp(0, self.seq_length - 1)  # (batch,)
-            # 为 mask 设置终点
-            end_indices_mask = end_indices.view(batch_size, 1, 1)  # (batch, 1, 1)
-            mask.scatter_(1, end_indices_mask, 1.0)
+            # 为 mask_xy 设置终点
+            end_indices_xy = end_indices.view(batch_size, 1, 1).expand(-1, 1, 2)  # (batch, 1, 2)
+            mask_xy.scatter_(1, end_indices_xy, 1.0)
             # 为 x_c 设置终点 (仅 x, y 维度)
-            end_indices_xc = end_indices.view(batch_size, 1, 1).expand(-1, 1, 2)  # (batch, 1, 2)
-            x_c[:, :, :2].scatter_(1, end_indices_xc, end_point.unsqueeze(1))
+            x_c[:, :, :2].scatter_(1, end_indices_xy, end_point.unsqueeze(1))
         elif effective_length is not None and effective_length < self.seq_length:
             # 统一 int 长度
             end_idx = effective_length - 1
-            mask[:, end_idx, :] = 1.0
+            mask_xy[:, end_idx, :] = 1.0
             x_c[:, end_idx, :2] = end_point  # 仅 x, y
         else:
             # 默认: 终点在最后
-            mask[:, -1, :] = 1.0
+            mask_xy[:, -1, :] = 1.0
             x_c[:, -1, :2] = end_point  # 仅 x, y
 
         # 生成距离缩放的高斯噪声 ε (全维度)
@@ -480,9 +486,14 @@ class AlphaDDIM(nn.Module):
             padding_mask[:, :effective_length, :] = 1.0
             middle_points = middle_points * padding_mask
 
-        # 使用 mask 组合边界点和中间点
+        # 合并 mask: x, y 和 dt 分别处理
         # X_R = {p_0} ∥ {p_c + ε} ∥ {p_m} ∥ {0}
-        x = mask * x_c + (1 - mask) * middle_points
+        x = torch.zeros(batch_size, self.seq_length, self.input_dim, device=device)
+        # x, y 维度: 使用 mask_xy
+        x[:, :, :2] = mask_xy * x_c[:, :, :2] + (1 - mask_xy) * middle_points[:, :, :2]
+        # dt 维度: 使用 mask_dt (仅起点 dt[0]=0)
+        if self.input_dim > 2 and mask_dt is not None:
+            x[:, :, 2:] = mask_dt * x_c[:, :, 2:] + (1 - mask_dt) * middle_points[:, :, 2:]
 
         return x
 
@@ -506,6 +517,10 @@ class AlphaDDIM(nn.Module):
             - None: 终点在 seq_length-1
             - int: 所有样本终点在 effective_length-1
             - Tensor (batch,): 每个样本终点位置不同 (per-sample)
+
+        边界约束:
+        - x, y: 起点和终点
+        - dt: 仅起点 (dt[0] = 0)
         """
         batch_size = x.shape[0]
         device = x.device
@@ -515,13 +530,19 @@ class AlphaDDIM(nn.Module):
         # 处理 effective_length 的不同类型
         is_per_sample = isinstance(effective_length, torch.Tensor)
 
-        # 创建掩码 M (仅对 x, y 维度有效，dt 维度不约束)
+        # 创建掩码 M
+        # x, y 维度: 起点和终点
+        # dt 维度: 仅起点 (dt[0] = 0)
         mask = torch.zeros_like(x)
-        mask[:, 0, :2] = 1.0  # 起点 (仅 x, y)
+        mask[:, 0, :2] = 1.0  # 起点 (x, y)
+        if self.input_dim > 2:
+            mask[:, 0, 2:] = 1.0  # 起点 (dt[0] = 0)
 
-        # 创建条件值 X_c (仅设置 x, y 维度)
-        x_c = x.clone()  # 复制原始轨迹，保留 dt 值
-        x_c[:, 0, :2] = start_point  # 起点 (仅 x, y)
+        # 创建条件值 X_c
+        x_c = x.clone()  # 复制原始轨迹
+        x_c[:, 0, :2] = start_point  # 起点 (x, y)
+        if self.input_dim > 2:
+            x_c[:, 0, 2:] = 0.0  # dt[0] = 0
 
         if is_per_sample:
             # Per-sample: 使用 scatter_ 设置每个样本的终点
@@ -541,7 +562,7 @@ class AlphaDDIM(nn.Module):
             mask[:, end_idx, :2] = 1.0  # 仅 x, y
             x_c[:, end_idx, :2] = end_point  # 仅 x, y
 
-        # 应用掩码: x' = M ⊙ X_c + (1-M) ⊙ x (dt 维度不受影响因为 mask 为 0)
+        # 应用掩码: x' = M ⊙ X_c + (1-M) ⊙ x
         x = mask * x_c + (1 - mask) * x
 
         return x
