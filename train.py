@@ -229,8 +229,8 @@ class Trainer:
             predicted_log_length = None
             unet = self.model_raw.model.module if self.distributed else self.model_raw.model
             if hasattr(unet, 'length_head') and unet.length_head is not None:
-                # 传入实际时间步 t，让 Shared Encoder 感知当前噪声水平
-                predicted_log_length = unet.predict_length(x_t, condition, alpha, time=t)
+                # 不传入 time，让长度预测不依赖时间步（与推理一致）
+                predicted_log_length = unet.predict_length(x_t, condition, alpha)
 
             # 使用DMTGLoss计算完整损失 (论文公式14 + 长度预测)
             # L = w1·LDDIM + w2·Lsim + w3·Lstyle + w4·Llength
@@ -319,8 +319,8 @@ class Trainer:
             predicted_log_length = None
             unet = self.model_raw.model.module if self.distributed else self.model_raw.model
             if hasattr(unet, 'length_head') and unet.length_head is not None:
-                # 传入实际时间步 t，让 Shared Encoder 感知当前噪声水平
-                predicted_log_length = unet.predict_length(x_t, condition, alpha, time=t)
+                # 不传入 time，让长度预测不依赖时间步（与推理一致）
+                predicted_log_length = unet.predict_length(x_t, condition, alpha)
 
             # 使用DMTGLoss计算完整损失 (论文公式14 + 长度预测)
             loss_dict = self.loss_fn(
