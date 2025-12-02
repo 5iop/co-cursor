@@ -360,8 +360,8 @@ class TrajectoryUNet(nn.Module):
             self.length_head = LengthPredictionHead(
                 encoder_dim=self.bottleneck_dim,
                 condition_dim=time_emb_dim,
-                hidden_dim=256,
-                num_layers=5,
+                hidden_dim=512,
+                num_layers=3,
                 output_dim=1,
             )
         else:
