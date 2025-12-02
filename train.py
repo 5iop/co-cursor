@@ -429,9 +429,23 @@ class Trainer:
             total_epochs: 总训练轮数（用于重新计算 LR scheduler）
                          如果为 None，使用 Trainer 初始化时的 num_epochs
         """
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
-        self.model_raw.load_state_dict(checkpoint['model_state_dict'])
+        # DDP: checkpoint 保存时去掉了 module. 前缀，加载时需要加回来
+        model_state = checkpoint['model_state_dict']
+        if self.distributed:
+            # 给 UNet 的 keys 加回 module. 前缀
+            new_state = {}
+            for k, v in model_state.items():
+                if k.startswith('model.'):
+                    # model.xxx -> model.module.xxx
+                    new_key = k.replace('model.', 'model.module.', 1)
+                    new_state[new_key] = v
+                else:
+                    new_state[k] = v
+            model_state = new_state
+
+        self.model_raw.load_state_dict(model_state)
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
         self.epoch = checkpoint['epoch']
