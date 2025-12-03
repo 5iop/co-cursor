@@ -33,7 +33,7 @@ import platform
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.models.alpha_ddim import create_alpha_ddim
+from src.models.alpha_ddim import AlphaDDIM, create_alpha_ddim
 from src.data.dataset import CombinedMouseDataset
 from src.utils.notify import send_image_result
 
@@ -581,7 +581,14 @@ def main():
         timesteps = config.get('timesteps', 1000)
         input_dim = config.get('input_dim', 3)
         base_channels = config.get('base_channels', 96)
-        enable_length_prediction = config.get('enable_length_prediction', False)
+
+        # 检测是否启用长度预测：优先从 config 读取，否则从 state_dict 推断
+        if 'enable_length_prediction' in config:
+            enable_length_prediction = config['enable_length_prediction']
+        else:
+            # 旧版 checkpoint 没有这个字段，从 state_dict 推断
+            model_state = checkpoint.get('model_state_dict', {})
+            enable_length_prediction = any('length_head' in k for k in model_state.keys())
 
         # 创建与训练时相同配置的模型
         from src.models.unet import TrajectoryUNet
