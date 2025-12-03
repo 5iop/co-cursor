@@ -493,6 +493,11 @@ class Trainer:
         for epoch in range(start_epoch, end_epoch):
             self.epoch = epoch + 1
 
+            # 每个epoch开始前打印关键参数
+            if is_main_process():
+                current_lr = self.scheduler.get_last_lr()[0]
+                print(f"\n[Epoch {self.epoch}/{end_epoch}] LR: {current_lr:.2e} | Best: {self.best_loss:.4f}")
+
             # 训练
             train_loss = self.train_epoch()
 
@@ -502,10 +507,8 @@ class Trainer:
                 dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
                 train_loss = loss_tensor.item()
 
-            if is_main_process():
-                print(f"Epoch {self.epoch} - Train Loss: {train_loss:.4f}")
-
             # 验证
+            val_loss = None
             if self.val_loader is not None:
                 val_loss = self.validate()
 
@@ -514,46 +517,34 @@ class Trainer:
                     dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
                     val_loss = loss_tensor.item()
 
-                if is_main_process():
-                    print(f"Epoch {self.epoch} - Val Loss: {val_loss:.4f}")
+            if is_main_process():
+                if val_loss is not None:
+                    print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+                else:
+                    print(f"Train Loss: {train_loss:.4f}")
 
-                # 保存最佳模型
-                if val_loss < self.best_loss:
-                    self.best_loss = val_loss
-                    self.save_checkpoint("best_model.pt")
-                    self.run_tsne_plot_async()  # 后台运行 t-SNE 绘图
-                    # 发送 best model 通知 (只在主进程发送)
-                    if self.webhook_url and is_main_process():
-                        send_training_update(
-                            epoch=self.epoch,
-                            loss=val_loss,
-                            best_loss=self.best_loss,
-                            is_best=True,
-                            webhook_url=self.webhook_url,
-                            extra_info="New best model saved!",
-                        )
-            else:
-                if train_loss < self.best_loss:
-                    self.best_loss = train_loss
-                    self.save_checkpoint("best_model.pt")
-                    self.run_tsne_plot_async()  # 后台运行 t-SNE 绘图
-                    # 发送 best model 通知 (只在主进程发送)
-                    if self.webhook_url and is_main_process():
-                        send_training_update(
-                            epoch=self.epoch,
-                            loss=train_loss,
-                            best_loss=self.best_loss,
-                            is_best=True,
-                            webhook_url=self.webhook_url,
-                            extra_info="New best model saved!",
-                        )
+            # 保存最佳模型
+            current_loss = val_loss if val_loss is not None else train_loss
+            if current_loss < self.best_loss:
+                self.best_loss = current_loss
+                self.save_checkpoint("best_model.pt")
+                self.run_tsne_plot_async()  # 后台运行 t-SNE 绘图
+                # 发送 best model 通知 (只在主进程发送)
+                if self.webhook_url and is_main_process():
+                    send_training_update(
+                        epoch=self.epoch,
+                        loss=current_loss,
+                        best_loss=self.best_loss,
+                        is_best=True,
+                        webhook_url=self.webhook_url,
+                        extra_info="New best model saved!",
+                    )
 
             # 更新学习率
             self.scheduler.step()
 
             # 周期性训练进度通知（best model 已发送时跳过，只在主进程发送）
-            is_best_this_epoch = (self.val_loader and val_loss == self.best_loss) or \
-                                 (not self.val_loader and train_loss == self.best_loss)
+            is_best_this_epoch = current_loss == self.best_loss
             if self.webhook_url and is_main_process() and self.epoch % self.notify_every == 0 and not is_best_this_epoch:
                 current_loss = val_loss if self.val_loader else train_loss
                 send_training_update(
