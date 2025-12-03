@@ -286,12 +286,17 @@ def generate_model_trajectories(
                     )
 
                 # 提取特征
+                skipped = 0
                 for traj in trajectories.cpu().numpy():
                     feat = extract_temporal_features(traj)
                     if feat is not None:
                         features_list.append(feat)
                         alpha_labels_list.append(alpha)
                         generated += 1
+                    else:
+                        skipped += 1
+                if skipped > 0:
+                    print(f"  [Warning] Skipped {skipped}/{current_batch} samples (invalid features)")
 
                 pbar.update(current_batch)
 
