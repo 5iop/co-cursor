@@ -169,6 +169,7 @@ class Trainer:
         self.epoch = 0
         self.best_loss = float('inf')
         self.train_losses = []
+        self.learning_rates = []
 
         # 自动绘图选项
         self.plot = plot
@@ -393,6 +394,7 @@ class Trainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_loss': self.best_loss,
             'train_losses': self.train_losses,
+            'learning_rates': self.learning_rates,
         }
 
         path = self.checkpoint_dir / filename
@@ -452,6 +454,7 @@ class Trainer:
         self.global_step = checkpoint['global_step']
         self.best_loss = checkpoint['best_loss']
         self.train_losses = checkpoint.get('train_losses', [])
+        self.learning_rates = checkpoint.get('learning_rates', [])
 
         # 重新创建 scheduler 以匹配目标总轮数
         # 这避免了 T_max 不匹配导致的 LR 衰减过快/过慢问题
@@ -540,7 +543,8 @@ class Trainer:
                         extra_info="New best model saved!",
                     )
 
-            # 更新学习率
+            # 记录当前 epoch 的学习率，然后更新
+            self.learning_rates.append(self.scheduler.get_last_lr()[0])
             self.scheduler.step()
 
             # 周期性训练进度通知（best model 已发送时跳过，只在主进程发送）
@@ -588,6 +592,7 @@ class Trainer:
             'epoch': self.epoch,
             'global_step': self.global_step,
             'train_losses': self.train_losses,
+            'learning_rates': self.learning_rates,
             'best_loss': self.best_loss,
             'timestamp': datetime.now().isoformat(),
         }
