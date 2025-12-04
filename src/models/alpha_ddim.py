@@ -111,6 +111,36 @@ class AlphaDDIM(nn.Module):
 
         return sqrt_recip_alphas_cumprod_t * x_t - sqrt_recipm1_alphas_cumprod_t * noise
 
+    # ========== 统一噪声缩放系数 ==========
+    # 常量: 最小噪声缩放，保证模型输入在训练分布内
+    MIN_NOISE_SCALE = 0.2
+
+    @staticmethod
+    def compute_noise_scale(alpha: float) -> float:
+        """
+        计算统一的噪声缩放系数
+
+        noise_scale = MIN + (1 - MIN) * raw
+        其中 raw = 1 - 1/α
+
+        效果:
+        - α=1.0 → noise_scale = 0.2 (最小噪声，接近直线)
+        - α=1.5 → noise_scale = 0.2 + 0.8 * 0.33 = 0.47
+        - α=2.0 → noise_scale = 0.2 + 0.8 * 0.5 = 0.6
+        - α=3.0 → noise_scale = 0.2 + 0.8 * 0.67 = 0.74
+        - α→∞  → noise_scale → 1.0
+
+        Args:
+            alpha: path_ratio ∈ [1, +∞)
+
+        Returns:
+            noise_scale ∈ [MIN_NOISE_SCALE, 1.0]
+        """
+        alpha_clamped = max(1.0, alpha)
+        raw_scale = max(0.0, 1.0 - 1.0 / alpha_clamped)
+        noise_scale = AlphaDDIM.MIN_NOISE_SCALE + (1.0 - AlphaDDIM.MIN_NOISE_SCALE) * raw_scale
+        return min(noise_scale, 1.0)  # 确保不超过 1
+
     @torch.no_grad()
     def ddim_sample_step(
         self,
@@ -119,24 +149,14 @@ class AlphaDDIM(nn.Module):
         t_prev: torch.Tensor,
         condition: torch.Tensor,
         alpha: float = 1.5,  # 论文方案A: path_ratio ∈ [1, +∞)
-        eta: float = 0.0,  # DDIM随机性参数
+        eta: float = 0.5,  # DDIM随机性参数
     ) -> torch.Tensor:
         """
         α-DDIM单步采样 (论文 Eq.4-6)
 
-        核心创新: 双协方差混合
-        Σ = (1-α')·Σ_d + α'·Σ_n
-
-        其中 α' = 1 - 1/α 将 Paper A 的 α ∈ [1, +∞) 转换为 [0, 1):
-        - α = 1 (直线) → α' = 0 → 100% 方向噪声
-        - α → ∞ (复杂) → α' → 1 → 100% 各向同性噪声
-
-        论文 Eq.4: Σ_d = (k_c·||d||)² · (d̂ ⊗ d̂)  -- 方向协方差 (秩1矩阵)
-        论文 Eq.5: z_d = σ_d · ε · d̂ 其中 σ_d = k_c·||d||  -- 方向噪声采样
-        论文 Eq.6: Σ = (1-α')·Σ_d + α'·Σ_n    -- 混合协方差 (Σ_n = σ²_n·I 各向同性)
-
-        采样: z ~ N(0, Σ) ≈ √(1-α')·z_d + √α'·z_n
-        其中 z_d ~ N(0, Σ_d), z_n ~ N(0, Σ_n)
+        核心创新: 双协方差混合 + 统一噪声缩放
+        - noise_scale = compute_noise_scale(α): α=1 → 0.2, α→∞ → 1.0
+        - 所有噪声项 (σ_d, σ_ε, eta) 都乘以 noise_scale
 
         Args:
             x_t: 当前时刻的噪声数据 (batch, seq_len, input_dim)
@@ -144,10 +164,11 @@ class AlphaDDIM(nn.Module):
             t_prev: 上一个时间步
             condition: 条件（起点+终点）(batch, 4)
             alpha: Paper A path_ratio (α ≥ 1, 越大越复杂)
-            eta: DDIM随机性参数
+            eta: DDIM随机性参数 (会被 noise_scale 缩放)
         """
         batch_size = x_t.shape[0]
-        alpha_tensor = torch.full((batch_size,), alpha, device=x_t.device, dtype=x_t.dtype)
+        alpha_clamped = max(1.0, alpha)
+        alpha_tensor = torch.full((batch_size,), alpha_clamped, device=x_t.device, dtype=x_t.dtype)
 
         # 预测噪声 - 论文Eq.10: ε_θ(x_t, t, c, α)
         predicted_noise = self.model(x_t, t, condition, alpha_tensor)
@@ -165,6 +186,10 @@ class AlphaDDIM(nn.Module):
         # 预测x_0
         pred_x0 = self.predict_x0_from_noise(x_t, t, predicted_noise)
 
+        # ========== 统一噪声缩放系数 ==========
+        # 使用统一入口计算 noise_scale
+        noise_scale = self.compute_noise_scale(alpha)
+
         # ========== 论文 Eq.4-6: 双协方差混合 ==========
         # 计算方向向量 (起点到终点)
         start_point = condition[:, :2]  # (batch, 2)
@@ -174,41 +199,36 @@ class AlphaDDIM(nn.Module):
         direction_unit = direction / direction_norm  # 单位方向向量 d̂
 
         # 论文 Eq.4: k_c 是常数缩放因子 (论文推荐值 ≈ 1/6)
-        # 注意: k_c 应该是常数，而非距离的函数
         kc = 1.0 / 6.0
 
-        # DDIM 噪声方差 (标准 DDIM 公式)
-        sigma_squared = eta ** 2 * (
+        # DDIM 噪声方差 - eta 也要乘以 noise_scale
+        eta_eff = eta * noise_scale
+        sigma_squared = eta_eff ** 2 * (
             (1 - alpha_t_prev) / (1 - alpha_t + 1e-8) * (1 - alpha_t / (alpha_t_prev + 1e-8))
         )
         sigma_base = torch.sqrt(torch.clamp(sigma_squared, min=0))
 
         # ========== 从混合协方差采样 ==========
-        # 论文 Eq.4: z_d ~ N(0, Σ_d) 其中 Σ_d = (k_c·||d||)²·(d̂⊗d̂)
-        # 方向协方差是秩1矩阵，标准差为 σ_d = k_c·||d||
-        # 采样为: z_d = σ_d · ε_1 · d̂，其中 ε_1 ~ N(0, 1) 是标量
-        # 注意: 方向噪声仅适用于 x, y 维度，dt 维度使用各向同性噪声
-        noise_scalar = torch.randn(batch_size, self.seq_length, 1, device=x_t.device)
+        # 方向噪声: z_d = σ_d · ε · d̂
+        # 所有点共享同一个噪声标量，减少逐点锯齿
+        noise_scalar = torch.randn(batch_size, 1, 1, device=x_t.device)  # (batch, 1, 1) 全序列共享
         direction_unit_expanded = direction_unit.unsqueeze(1)  # (batch, 1, 2)
-        # 标准差 σ_d = k_c · ||d|| (从协方差 Σ_d = σ_d² · (d̂⊗d̂) 得到)
-        sigma_d = (kc * direction_norm).unsqueeze(1)  # (batch, 1, 1)
-        z_d_xy = sigma_d * noise_scalar * direction_unit_expanded  # (batch, seq, 2) 仅 x, y
+        # 标准差 σ_d = k_c · ||d|| · noise_scale
+        sigma_d = (kc * direction_norm * noise_scale).unsqueeze(1)  # (batch, 1, 1)
+        z_d_xy = sigma_d * noise_scalar * direction_unit_expanded  # (batch, 1, 2) -> broadcast to (batch, seq, 2)
 
-        # 各向同性噪声 (x, y 维度): z_n_xy ~ N(0, Σ_n) 其中 Σ_n = (k_c·||d||)²·I
-        # 标准差 σ_n = k_c·||d|| (与方向噪声使用相同的缩放因子)
-        sigma_epsilon = (kc * direction_norm).unsqueeze(1)  # (batch, 1, 1)
+        # 各向同性噪声 (x, y 维度): z_n_xy ~ N(0, Σ_n)
+        # 标准差 σ_n = k_c · ||d|| · noise_scale
+        sigma_epsilon = (kc * direction_norm * noise_scale).unsqueeze(1)  # (batch, 1, 1)
         z_n_xy = sigma_epsilon * torch.randn(batch_size, self.seq_length, 2, device=x_t.device)
 
-        # 各向同性噪声 (dt 维度): 使用与 x,y 相同的缩放因子，保持尺度一致
-        # dt 已归一化到 [0,1]，使用相同的 σ_epsilon 避免尺度不匹配
+        # 各向同性噪声 (dt 维度)
         z_n_dt = sigma_epsilon * torch.randn(batch_size, self.seq_length, self.input_dim - 2, device=x_t.device) if self.input_dim > 2 else None
 
         # 论文 Eq.6: 混合协方差采样
-        # 将 α ∈ [1, +∞) 转换为混合系数 a ∈ [0, 1)
-        # a = 1 - 1/α: α=1 → a=0 (全方向), α→∞ → a→1 (全各向同性)
-        # 注意: 这与 StyleEmb 的 α'=1/(α+1) 不同，两者用途不同
-        mixing_coef = 1.0 - 1.0 / max(alpha, 1.0)
-        mixing_coef = min(mixing_coef, 0.99)  # 防止完全各向同性
+        # 混合系数使用原始 raw_scale (不含 MIN_NOISE_SCALE 偏移)
+        raw_scale = max(0.0, 1.0 - 1.0 / alpha_clamped)
+        mixing_coef = min(raw_scale, 0.99)  # 防止完全各向同性
 
         # z ~ N(0, (1-a)Σ_d + a·Σ_ε) ≈ √(1-a)·z_d + √a·z_n
         sqrt_dir = np.sqrt(1 - mixing_coef)    # 方向噪声权重
@@ -216,11 +236,11 @@ class AlphaDDIM(nn.Module):
 
         # 组合噪声: x, y 维度使用混合噪声，dt 维度仅使用各向同性噪声
         z_mixed = torch.zeros_like(x_t)  # (batch, seq, input_dim)
-        z_mixed[:, :, :2] = sqrt_dir * z_d_xy + sqrt_iso * z_n_xy  # x, y: 混合噪声 (距离缩放)
+        z_mixed[:, :, :2] = sqrt_dir * z_d_xy + sqrt_iso * z_n_xy  # x, y: 混合噪声
         if self.input_dim > 2 and z_n_dt is not None:
-            z_mixed[:, :, 2:] = z_n_dt  # dt: 标准高斯噪声 (σ=1，无距离缩放)
+            z_mixed[:, :, 2:] = z_n_dt  # dt: 各向同性噪声
 
-        # 应用总噪声: σ_t 来自 DDIM，z_mixed 来自混合协方差
+        # 应用总噪声
         sigma_t = sigma_base
 
         # DDIM更新公式: x_{t-1} = √α_{t-1}·x̂_0 + √(1-α_{t-1}-σ²_t)·ε_θ + σ_t·z
@@ -304,8 +324,9 @@ class AlphaDDIM(nn.Module):
             effective_length = max(2, effective_length)
 
         # 论文 Eq.2-3: 掩码初始化，支持距离缩放噪声和可控长度
+        # alpha 控制初始化噪声强度: α=1 时无噪声(直线)，α 越大噪声越大
         x = self._initialize_with_condition(
-            batch_size, condition, device, effective_length
+            batch_size, condition, device, effective_length, alpha=alpha_clamped
         )
 
         # 设置采样时间步
@@ -387,6 +408,7 @@ class AlphaDDIM(nn.Module):
         condition: torch.Tensor,
         device: str,
         effective_length=None,  # 有效轨迹长度 m，支持 int 或 Tensor (batch,)
+        alpha: float = 1.5,  # 复杂度参数，用于控制初始化噪声强度
     ) -> torch.Tensor:
         """
         按论文 Eq.(2-3) 初始化:
@@ -397,11 +419,16 @@ class AlphaDDIM(nn.Module):
 
         k_c = 1/6 (使99%的点在屏幕内)
 
+        修改: 噪声强度由 alpha 控制，使用统一的 compute_noise_scale
+        - noise_scale = MIN + (1-MIN) * (1-1/α): α=1 → 0.2, α→∞ → 1.0
+        - sigma_epsilon *= noise_scale
+
         Args:
             effective_length: 有效轨迹长度，支持:
                 - None: 使用 seq_length
                 - int: 所有样本使用相同长度
                 - Tensor (batch,): 每个样本使用不同长度 (per-sample)
+            alpha: 复杂度参数 (path_ratio ∈ [1, +∞))
         """
         start_point = condition[:, :2]  # (batch, 2)
         end_point = condition[:, 2:]    # (batch, 2)
@@ -423,10 +450,12 @@ class AlphaDDIM(nn.Module):
         else:
             lengths = None
 
-        # 论文 Eq.2: σ_ε = k_c · ||d||，其中 k_c = 1/6
-        # 不除以 √(m-1)，按论文原始公式
+        # 使用统一的噪声缩放系数
+        noise_scale = self.compute_noise_scale(alpha)
+
+        # 论文 Eq.2: σ_ε = k_c · ||d|| · noise_scale
         k_c = 1.0 / 6.0
-        sigma_epsilon = k_c * distance  # (batch, 1)
+        sigma_epsilon = k_c * distance * noise_scale  # (batch, 1)
         sigma_epsilon = sigma_epsilon.unsqueeze(2)  # (batch, 1, 1) for broadcasting
 
         # 创建掩码 M (论文 Eq.2)
